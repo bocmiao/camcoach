@@ -139,7 +139,7 @@ jobs:
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
-            <key>method</key><string>app-store</string>
+            <key>method</key><string>app-store-connect</string>
             <key>teamID</key><string>${TEAM_ID}</string>
             <key>signingStyle</key><string>manual</string>
             <key>uploadSymbols</key><true/>
@@ -170,8 +170,13 @@ jobs:
           IPA_PATH: ${{ runner.temp }}/export/CamCoach.ipa
         run: |
           set -euo pipefail
-          gem install fastlane --no-document
-          fastlane upload
+          # 用 bundler 而不是 gem install fastlane：
+          # runner 是 Ruby 3.4，fastlane 依赖的 mutex_m / base64 已经不在默认 gem 里，
+          # 这些依赖在 Gemfile 里显式声明了。
+          gem install bundler --no-document
+          bundle install --quiet
+          bundle exec fastlane --version
+          bundle exec fastlane upload
 
       - name: 失败时把关键产物留下来
         if: failure()

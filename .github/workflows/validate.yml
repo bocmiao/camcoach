@@ -1,0 +1,73 @@
+name: 工程校验（免签名）
+
+# 这个流水线不需要任何证书、描述文件、API Key。
+# 它只回答三个问题：
+#   1. project.yml 能不能生成出有效的 Xcode 工程？
+#   2. Swift 代码能不能编译通过？
+#   3. fastlane 在当前 Ruby 版本下能不能加载？
+#
+# 关键在最后编译那步的 CODE_SIGNING_ALLOWED=NO —— 跳过签名，就不用等 Secrets 配好。
+# 这样代码有问题能立刻发现，不用把它和签名问题混在一起排查。
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'project.yml'
+      - 'CamCoach/**'
+      - 'Gemfile'
+      - 'fastlane/**'
+      - '.github/workflows/validate.yml'
+
+jobs:
+  validate:
+    runs-on: macos-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: 取代码
+        uses: actions/checkout@v4
+
+      - name: 环境
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcode-select -p
+
+      - name: 装 XcodeGen
+        run: brew install xcodegen
+
+      - name: 从 project.yml 生成工程
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          # 生成完立刻列一遍。scheme 名对不上是这里最常见的失败，
+          # 与其等 archive 阶段报一句含混的错，不如现在就看清楚。
+          xcodebuild -list -project CamCoach.xcodeproj
+
+      - name: 编译（不签名）
+        run: |
+          set -euo pipefail
+          # 不接 xcbeautify：它不在 runner 上，装了还要多等一次 brew。
+          # 而且管道会把 xcodebuild 的退出码吞掉，失败反而看不出来。
+          xcodebuild build \
+            -project CamCoach.xcodeproj \
+            -scheme CamCoach \
+            -configuration Debug \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: 产物在哪
+        if: always()
+        run: |
+          find build -name "CamCoach.app" -maxdepth 6 2>/dev/null || echo "没找到 .app（如果上一步失败，这是正常的）"
+
+      - name: fastlane 能否加载
+        run: |
+          set -euo pipefail
+          gem install bundler --no-document
+          bundle install --quiet
+          bundle exec fastlane --version
