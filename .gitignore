@@ -1,0 +1,23 @@
+# XcodeGen 生成的东西不入库
+*.xcodeproj/
+CamCoach/Info.plist
+
+# 构建产物
+build/
+DerivedData/
+*.xcarchive
+*.ipa
+
+# 签名材料——这些是密码级别的东西，绝不进仓库
+*.p12
+*.p8
+*.cer
+*.mobileprovision
+cert/
+.env
+
+# fastlane 的临时文件
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/
+fastlane/test_output/

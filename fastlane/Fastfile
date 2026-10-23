@@ -1,0 +1,26 @@
+default_platform(:ios)
+
+# 这里只做一件事：上传。
+# 编译和签名交给 workflow 里的 xcodebuild——因为那两个环节出错时，
+# xcodebuild 的日志比 gym 的日志更容易定位到具体哪一步。
+platform :ios do
+  desc "把已导出的 ipa 上传到 TestFlight"
+  lane :upload do
+    api_key = app_store_connect_api_key(
+      key_id: ENV.fetch("ASC_KEY_ID"),
+      issuer_id: ENV.fetch("ASC_ISSUER_ID"),
+      key_content: ENV.fetch("ASC_KEY_CONTENT"),
+      is_key_content_base64: true,
+      duration: 1200,
+      in_house: false
+    )
+
+    upload_to_testflight(
+      api_key: api_key,
+      ipa: ENV.fetch("IPA_PATH"),
+      skip_waiting_for_build_processing: true,
+      skip_submission: true,
+      changelog: "自检版：验证无 Mac 的构建链路"
+    )
+  end
+end

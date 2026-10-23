@@ -1,0 +1,63 @@
+# XcodeGen 工程描述文件
+# 为什么不用 .xcodeproj：那是个几千行的 pbxproj，手写必错，而且你本地没有 Xcode 打不开、改不了。
+# 这里用一个 YAML 描述工程，CI 里跑 `xcodegen generate` 生成 .xcodeproj。
+# 好处是这份文件可读、可 diff、可在 Windows 上直接改。
+
+name: CamCoach
+
+options:
+  bundleIdPrefix: com.camcoach
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    # 关掉脚本沙盒，避免个别构建阶段被拦
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+
+targets:
+  CamCoach:
+    type: application
+    platform: iOS
+    sources:
+      - path: CamCoach
+        excludes:
+          # Info.plist 由下面的 info 段生成，不能再被当成资源打进去
+          - "Info.plist"
+
+    info:
+      path: CamCoach/Info.plist
+      properties:
+        CFBundleDisplayName: 取景助手
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        ITSAppUsesNonExemptEncryption: false
+        # 连相机走本地网络，这条文案不给的话 iOS 会静默拦截
+        NSLocalNetworkUsageDescription: 连接相机时需要访问本地网络，用于读取取景画面与拍摄参数。
+
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.camcoach.app
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        # 手动签名：证书和 profile 都由 CI 从 secrets 导入，不让 Xcode 自己去要
+        CODE_SIGN_STYLE: Manual
+        TARGETED_DEVICE_FAMILY: "1"
+        SUPPORTS_MACCATALYST: NO
+
+# 显式声明 scheme，不依赖 XcodeGen 的默认推断。
+# 因为 workflow 里 archive 要用 -scheme CamCoach，名字对不上就是一句含糊的报错。
+schemes:
+  CamCoach:
+    build:
+      targets:
+        CamCoach: all
+    run:
+      config: Debug
+    archive:
+      config: Release

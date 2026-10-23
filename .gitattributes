@@ -1,0 +1,17 @@
+# 仓库内一律用 LF 存储。
+# 不然 Windows 上 checkout 出 CRLF，shell 脚本在 macOS runner 上会报
+# "bad interpreter: /usr/bin/env bash^M" —— 这个错误很难一眼看出来。
+* text=auto eol=lf
+
+# 这几类必须严格 LF
+*.sh    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.rb    text eol=lf
+
+# 二进制，别碰
+*.p12   binary
+*.cer   binary
+*.mobileprovision binary
+*.png   binary
+*.jpg   binary
