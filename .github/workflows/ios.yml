@@ -17,6 +17,36 @@ jobs:
       - name: 取代码
         uses: actions/checkout@v4
 
+      # 先查 secrets。缺了的话直接说清楚缺哪个，
+      # 而不是让人对着 "SecKeychainItemImport: The user name or passphrase..." 这种报错发愣。
+      - name: 检查 Secrets 是否配好
+        env:
+          CERT: ${{ secrets.IOS_CERT_P12_BASE64 }}
+          PROFILE: ${{ secrets.IOS_PROFILE_BASE64 }}
+          ASC_KEY: ${{ secrets.ASC_KEY_CONTENT }}
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          missing=""
+          # 用 if 而不是 `[ -z "$X" ] && missing=...`：
+          # 后者在 bash 里其实不会触发 set -e（&& 列表非末尾的命令受保护），
+          # 但那个规则太绕，写成 if 一眼就能看懂。
+          if [ -z "$CERT" ];    then missing="$missing  IOS_CERT_P12_BASE64"; fi
+          if [ -z "$PROFILE" ]; then missing="$missing  IOS_PROFILE_BASE64"; fi
+          if [ -z "$ASC_KEY" ]; then missing="$missing  ASC_KEY_CONTENT"; fi
+          if [ -z "$TEAM" ];    then missing="$missing  APPLE_TEAM_ID"; fi
+          if [ -n "$missing" ]; then
+            echo "::error::还缺这几个 Secrets：$missing"
+            echo "## 还缺 Secrets" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "缺：\`$missing\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "照 \`tools/make-ios-cert.sh step2\` 最后打印的清单，在仓库 Settings → Secrets and variables → Actions 里补齐。" >> "$GITHUB_STEP_SUMMARY"
+            echo "全部填完再点一次 Run workflow。" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Secrets 齐了，继续。"
+
       - name: 环境自曝（出问题时先看这段）
         run: |
           sw_vers
