@@ -1,10 +1,14 @@
 # CamCoach · 取景助手
 
+[![工程校验](https://github.com/bocmiao/camcoach/actions/workflows/validate.yml/badge.svg)](https://github.com/bocmiao/camcoach/actions/workflows/validate.yml)
+
 给新手用的相机取景辅助工具。iPhone 用 USB 连上相机，实时看画面、读参数，画面对了不说话，不对了告诉你该改哪个数。
 
 **当前状态：v0.1.0 —— 只验证构建链路，还没有接入相机。**
 
 这个版本唯一要证明的事：**没有 Mac，也能把 App 装到 iPhone 上**。界面上是一个自检清单，全绿就说明流水线通了。
+
+已实测通过的部分（`工程校验（免签名）` 流水线，不需要任何证书）：`project.yml` 能生成有效工程、Swift 代码编译通过、`CamCoach.app` 产物为真机架构、fastlane 可用。**待验证：签名与 TestFlight 上传**（需要配好 Secrets）。
 
 ---
 
@@ -27,12 +31,22 @@
 
 | 能力 | 状态 |
 |---|---|
-| 无 Mac 的 CI 构建链路 | ✅ v0.1.0 |
+| 无 Mac 的 CI 构建链路 | ✅ 免签名编译已验证通过 |
 | 相机能力自检（系统版本 / PTP 通道 / ImageCaptureCore 链接） | ✅ v0.1.0 |
+| 签名 + 上传 TestFlight | ⬜ 等 Secrets 配好 |
 | USB 枚举相机、Sony 私有握手 | ⬜ v0.2.0 |
 | 读拍摄参数、写参数（含回读确认） | ⬜ v0.2.0 |
 | 取景流 + 像素级体检 | ⬜ v0.3.0 |
 | 意图预设 + 越线一键修正 | ⬜ v0.4.0 |
+
+## 两条流水线
+
+| 流水线 | 需要 Secrets | 什么时候跑 |
+|---|---|---|
+| **工程校验（免签名）** | ❌ 不需要 | 改代码时自动跑。用 `CODE_SIGNING_ALLOWED=NO` 跳过签名，只验工程生成 + 编译 + fastlane |
+| **iOS 构建并上传 TestFlight** | ✅ 需要 | 推 main 或手动触发。签名、导出 ipa、上传 |
+
+分开的原因：签名问题（证书、profile、scope）和代码问题需要分开排查。混在一条流水线里，一个编译错误会被前面的签名失败挡住，看不到。
 
 ---
 
