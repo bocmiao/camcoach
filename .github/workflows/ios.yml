@@ -17,7 +17,18 @@ jobs:
       - name: 取代码
         uses: actions/checkout@v4
 
-      # 先查 secrets。缺了的话直接说清楚缺哪个，
+      # 环境信息放最前面：每次运行都能看到 runner 给的是什么系统、什么 Xcode。
+      # App Store 对 SDK 版本有要求，这个信息越早知道越好。
+      - name: 环境自曝
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcode-select -p
+          echo "--- 可用 SDK ---"
+          xcodebuild -showsdks 2>/dev/null | grep -i "iOS" || true
+          ruby --version
+
+      # 再查 secrets。缺了的话直接说清楚缺哪个，
       # 而不是让人对着 "SecKeychainItemImport: The user name or passphrase..." 这种报错发愣。
       - name: 检查 Secrets 是否配好
         env:
@@ -46,13 +57,6 @@ jobs:
             exit 1
           fi
           echo "Secrets 齐了，继续。"
-
-      - name: 环境自曝（出问题时先看这段）
-        run: |
-          sw_vers
-          xcodebuild -version
-          xcode-select -p
-          ruby --version
 
       - name: 装 XcodeGen
         run: brew install xcodegen
