@@ -13,6 +13,9 @@ DerivedData/
 *.p8
 *.cer
 *.mobileprovision
+*.key
+*.b64
+secrets.txt
 cert/
 .env
 
@@ -21,3 +24,7 @@ fastlane/report.xml
 fastlane/Preview.html
 fastlane/screenshots/
 fastlane/test_output/
+
+# Python 缓存
+__pycache__/
+*.pyc

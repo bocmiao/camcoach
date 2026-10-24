@@ -60,6 +60,19 @@
 
 ### 一次性准备
 
+**最短路径**：你只需要手动建一个 API 密钥，剩下的全自动。
+
+1. 打开 `https://appstoreconnect.apple.com` → `用户和访问` → `集成` → `App Store Connect API` → `团队密钥` → 生成 API 密钥。权限选 **App Manager**。下载 `AuthKey_XXXXXXXXXX.p8`（只能下一次）。
+
+2. 把 `.p8` 放进 `tools/`，双击 `tools/apple-auto.cmd`。它会依次完成：生成私钥和 CSR → 让 Apple 签成发布证书 → 合成 `.p12` → 建 Bundle ID → 建 App Store 描述文件 → 输出全部 Secrets。中途只会问你一个 Issuer ID。
+
+3. 打开 `tools/cert/secrets.txt`，8 条已转好格式，逐条填进仓库 `Settings → Secrets and variables → Actions`。
+
+详细到每一屏的说明在 [docs/cert-guide.md](docs/cert-guide.md)。脚本自带的离线自测 `python tools/selftest.py` 覆盖 JWT 签名、CSR、p12 打包和六步流程编排。
+
+<details>
+<summary>手动路径（不用 API 密钥）</summary>
+
 在 `ios` 目录下：
 
 ```bat
@@ -77,9 +90,9 @@ make-cert step2
 > **别直接在 cmd 里敲 `bash`。** Git for Windows 只把 `Git\cmd` 加进 PATH，那里只有 `git.exe`，没有 `bash.exe`。`make-cert.cmd` 会自己去 `C:\Program Files\Git\bin\bash.exe` 找。
 > 用 Git Bash 窗口的话，`bash tools/make-ios-cert.sh step1` 同样可以。
 >
-> 顺带提醒：`.cmd` 文件里不能写中文——cmd.exe 按 GBK 读批处理文件，UTF-8 的中文会被切碎当成命令执行。所以那个文件是纯英文的，中文提示都由 bash 那边输出。
+> 顺带提醒：`.cmd` 文件里不能写中文——cmd.exe 按 GBK 读批处理文件，UTF-8 的中文会被切碎当成命令执行。所以那个文件是纯英文的，中文提示都由 bash 或 Python 输出。
 
-然后在仓库 Settings → Secrets and variables → Actions 里填 8 个值，详见脚本输出。
+</details>
 
 ### 触发构建
 
@@ -99,8 +112,13 @@ CamCoach/
   ios.yml                   签名 + 构建 + 上传 TestFlight
   validate.yml              免签名校验（不需要证书，改代码就自动跑）
 fastlane/Fastfile           仅负责上传 TestFlight
-make-cert.cmd               Windows 入口：找到 bash 并调用下面的脚本
-tools/make-ios-cert.sh      生成 iOS 发布证书（openssl）
+tools/apple-auto.py         一站式：证书 + Bundle ID + 描述文件全部走 API 自动生成
+tools/apple-auto.cmd        Windows 双击入口
+tools/selftest.py           上面那个脚本的离线自测（41 项）
+tools/make-ios-cert.sh      手动路径：纯 openssl 生成证书
+make-cert.cmd               手动路径的 Windows 入口
+docs/cert-guide.md          证书与 Secrets 的完整操作说明
+docs/why-apache.md          License 决策推导
 ```
 
 ---

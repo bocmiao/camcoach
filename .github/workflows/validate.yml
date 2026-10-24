@@ -17,6 +17,7 @@ on:
       - 'CamCoach/**'
       - 'Gemfile'
       - 'fastlane/**'
+      - 'tools/**'
       - '.github/workflows/validate.yml'
 
 jobs:
@@ -71,3 +72,13 @@ jobs:
           gem install bundler --no-document
           bundle install --quiet
           bundle exec fastlane --version
+
+      - name: 证书脚本自测
+        run: |
+          set -euo pipefail
+          # 用 venv 而不是直接 pip install：runner 上的 python 可能是
+          # externally-managed，直接装会被 PEP 668 拦下来。
+          python3 -m venv "$RUNNER_TEMP/selftest-venv"
+          "$RUNNER_TEMP/selftest-venv/bin/pip" install --quiet --upgrade pip
+          "$RUNNER_TEMP/selftest-venv/bin/pip" install --quiet cryptography
+          "$RUNNER_TEMP/selftest-venv/bin/python" tools/selftest.py
