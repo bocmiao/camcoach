@@ -1,10 +1,19 @@
 name: iOS 构建并上传 TestFlight
 
-# 只在手动触发和 main 分支推送时跑。
-# 不挂在 PR 上——一次 macOS 构建很贵，别让每次改文案都烧一轮。
+# 只手动触发。这里踩过一次坑，别再改回去：
+#
+#   原来挂了 push: branches: [main]，结果每次改文档、改注释、甚至改错一行
+#   Swift 的提交，都会自动跑一遍完整的签名 + 上传，白烧一个 build 号。
+#   连着三次提交就吃掉了 1/2/3，其中 build 1 的 Swift 根本编不过也照样
+#   占了号。等真要发一个能用的包时，Apple 报：
+#     ENTITY_ERROR.ATTRIBUTE.INVALID.DUPLICATE
+#     The bundle version must be higher than the previously uploaded version: '3'
+#
+#   上传是不可撤销的，占掉的号拿不回来。所以上传必须是有意为之的动作：
+#   改好 project.yml 里的 CURRENT_PROJECT_VERSION，再手动点运行。
+#
+# 想编译验证（不上传签名）用 validate.yml，那个挂在 push 上、不花 build 号。
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
