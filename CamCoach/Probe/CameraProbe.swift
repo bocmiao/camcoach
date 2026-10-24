@@ -275,7 +275,7 @@ extension CameraProbe: ICCameraDeviceDelegate {
     // "type does not conform to protocol"，而且报错位置指向类型声明，
     // 不指到具体缺哪个，得往上翻 note 才知道。
 
-    func didRemoveDevice(_ device: ICDevice) {
+    func didRemove(_ device: ICDevice) {
         guard let cam = device as? ICCameraDevice, cam == camera else { return }
         camera = nil
         main { self.deviceLabel = "设备已移除" }
@@ -293,6 +293,28 @@ extension CameraProbe: ICCameraDeviceDelegate {
         if let error = error {
             log(.warn, "关闭会话时报错", detail: error.localizedDescription)
         }
+    }
+
+    // ---- ICCameraDeviceDelegate 里另外几个 required 方法。
+    // 这些在 ObjC 头文件里都没标 @optional，Swift 少一个就整个协议不通过。
+    // 我们暂时不关心内容目录的变化（这一版只问参数，不读照片），
+    // 所以留空——但方法必须存在。
+
+    func cameraDevice(_ camera: ICCameraDevice, didAdd items: [ICCameraItem]) {}
+    func cameraDevice(_ camera: ICCameraDevice, didRemove items: [ICCameraItem]) {}
+    func cameraDevice(_ camera: ICCameraDevice, didRenameItems items: [ICCameraItem]) {}
+    func cameraDeviceDidChangeCapability(_ camera: ICCameraDevice) {}
+
+    func cameraDeviceDidEnableAccessRestriction(_ device: ICDevice) {
+        log(.warn, "设备访问被限制", detail: "可能是 iOS 的隐私限制，需要在系统设置里允许")
+    }
+
+    func cameraDeviceDidRemoveAccessRestriction(_ device: ICDevice) {
+        log(.ok, "设备访问限制已解除")
+    }
+
+    func deviceDidBecomeReady(withCompleteContentCatalog device: ICCameraDevice) {
+        log(.info, "相机会话就绪")
     }
 
     // ---- ICCameraDeviceDelegate 的 required 两个。
@@ -319,10 +341,6 @@ extension CameraProbe: ICCameraDeviceDelegate {
         if let error = error {
             log(.fail, "相机会话打开出错", detail: error.localizedDescription)
         }
-    }
-
-    func cameraDeviceDidBecomeReady(withCompleteContentCatalog camera: ICCameraDevice) {
-        log(.info, "相机会话就绪")
     }
 
     func cameraDevice(_ camera: ICCameraDevice, didReceivePTPEvent data: Data) {
