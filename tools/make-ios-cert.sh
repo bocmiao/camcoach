@@ -60,7 +60,8 @@ step1() {
   echo "     选 「App Store」，App ID 选上一步建的，证书选刚签发的，下载 .mobileprovision"
   echo "     改名成 distribution.mobileprovision 放进 cert/ 目录"
   echo
-  echo "做完再跑： bash tools/make-ios-cert.sh step2"
+  echo "做完再跑： make-cert.cmd step2"
+  echo "（如果你在 Git Bash 窗口里，等价命令是 bash tools/make-ios-cert.sh step2）"
 }
 
 step2() {
