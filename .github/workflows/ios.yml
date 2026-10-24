@@ -79,6 +79,25 @@ jobs:
           security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
 
           printf '%s' "$CERT_P12_BASE64" | openssl base64 -d -A -out "$RUNNER_TEMP/cert.p12"
+
+          # 诊断：只打长度和大小，不泄漏内容。
+          # "MAC verification failed" 有两种可能——p12 解出来坏了，或者密码不对。
+          # 不打这几个数就只能靠猜。
+          echo "p12 base64 长度: ${#CERT_P12_BASE64}"
+          echo "解码后字节数: $(wc -c < "$RUNNER_TEMP/cert.p12" | tr -d ' ')"
+          echo "密码长度: ${#CERT_PASSWORD}"
+          echo "密码首字符: ${CERT_PASSWORD:0:1}"
+          echo "密码末字符: ${CERT_PASSWORD: -1}"
+
+          # 在 import 之前先单独验一次密码，失败信息比 security 的清楚
+          if openssl pkcs12 -info -noout -in "$RUNNER_TEMP/cert.p12" \
+               -passin "pass:$CERT_PASSWORD" 2>/dev/null; then
+            echo "PKCS12 密码校验: 通过"
+          else
+            echo "::error::p12 解码出来了，但这个密码打不开它。值在传输中被改过，或者写入时用的是另一个密码。"
+            exit 1
+          fi
+
           security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
             -P "$CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
 
