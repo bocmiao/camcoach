@@ -107,7 +107,28 @@ make-cert step2
 
 ### 触发构建
 
-推 `main` 分支，或手动 Run workflow。
+**上传流水线只能手动触发**（`gh workflow run ios.yml --ref main`，或在 Actions 页面点 Run workflow）。
+
+推 `main` 只会跑免签名的编译校验 —— 改文档、改注释、提交半成品都不会白烧 build 号。发版前记得先把 `project.yml` 里的 `CURRENT_PROJECT_VERSION` 加一。
+
+### 上传之后还有一步（别漏）
+
+**上传成功、build 状态 `VALID`，不代表手机上能看到它。**
+
+build 4 就是这么栽的：Actions 全绿、ASC 里 `VALID`，人打开 TestFlight 结果什么都没有 —— 因为 `betaGroups` 是空的。上传只完成了一半，还差三步：
+
+1. App 有一个**内部测试组**
+2. 这个 build **分配进**那个组
+3. 自己的 Apple ID **在组里**
+
+```
+python tools/testflight.py status     # 只读，看缺哪一环
+python tools/testflight.py attach     # 补齐，幂等
+```
+
+**API 上最坑的一点**：`POST /v1/betaGroups` 默认建的是**外部组**。外部组的第一个 build 必须过 Beta App Review，等 1~3 天。内部组必须在 attributes 里显式写 `"isInternalGroup": true` —— 而 `PATCH` 改不了这个字段（`The attribute 'isInternalGroup' can not be included in a 'UPDATE' operation`），建错了只能删掉重建。
+
+另外 `POST /v1/betaTesters` 必须同时带 `betaGroups` 或 `builds` 关系，只传 email 会报 `Either betaGroups or builds relationship is required when creating betaTesters`。
 
 ---
 
@@ -125,6 +146,7 @@ CamCoach/
 fastlane/Fastfile           仅负责上传 TestFlight
 tools/apple-auto.py         一站式：证书 + Bundle ID + 描述文件全部走 API 自动生成
 tools/apple-auto.cmd        Windows 双击入口
+tools/testflight.py         上传后收尾：内部测试组 + 挂 build + 加测试员
 tools/selftest.py           上面那个脚本的离线自测（41 项）
 tools/make-ios-cert.sh      手动路径：纯 openssl 生成证书
 make-cert.cmd               手动路径的 Windows 入口
