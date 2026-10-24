@@ -89,16 +89,19 @@ jobs:
 
           printf '%s' "$CERT_P12_BASE64" | openssl base64 -d -A -out "$RUNNER_TEMP/cert.p12"
 
-          # 诊断：只打长度和大小，不泄漏内容。
-          # "MAC verification failed" 有两种可能——p12 解出来坏了，或者密码不对。
-          # 不打这几个数就只能靠猜。
+          # 诊断：只打 base64 长度和解码后的字节数。
+          # 这两个数不涉及任何密钥材料，但能把「解码坏了」和「密码不对」区分开——
+          # 字节数明显偏小说明 base64 传输时被截断了，字节数正常但下面校验失败才是密码问题。
+          #
+          # ⚠️ 绝对不要在这里输出密码本身，也不要输出长度/首字符/末字符。
+          #    GitHub 的 secret 遮蔽只替换「完整的 secret 值」；`${#VAR}`、`${VAR:0:1}`
+          #    这类切片不会被遮蔽，会原样写进日志。而公开仓库的 Actions 日志任何人可读，
+          #    密码长度 + 首尾字符会把爆破空间缩掉一大截。
           echo "p12 base64 长度: ${#CERT_P12_BASE64}"
           echo "解码后字节数: $(wc -c < "$RUNNER_TEMP/cert.p12" | tr -d ' ')"
-          echo "密码长度: ${#CERT_PASSWORD}"
-          echo "密码首字符: ${CERT_PASSWORD:0:1}"
-          echo "密码末字符: ${CERT_PASSWORD: -1}"
 
-          # 在 import 之前先单独验一次密码，失败信息比 security 的清楚
+          # 在 import 之前先单独验一次密码，失败信息比 security 的清楚。
+          # stderr 全部丢弃——只需要「能不能打开」这个布尔结果，不需要 openssl 的细节。
           if openssl pkcs12 -info -noout -in "$RUNNER_TEMP/cert.p12" \
                -passin "pass:$CERT_PASSWORD" 2>/dev/null; then
             echo "PKCS12 密码校验: 通过"
