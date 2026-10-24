@@ -47,7 +47,8 @@ final class CameraProbe: NSObject, ObservableObject {
     override init() {
         super.init()
         browser.delegate = self
-        browser.browsedDeviceTypes = [.camera]
+        // 不设 browsedDeviceTypes：iOS 上这个成员不存在（macOS 才有），
+        // 默认就会枚举相机，够了。
     }
 
     // MARK: - 对外接口
@@ -116,7 +117,8 @@ final class CameraProbe: NSObject, ObservableObject {
         main { self.phase = "打开会话" }
 
         log(.info, "请求打开 PTP 会话")
-        cam.requestOpenSession()
+        // 这个方法是 async throws 的，不是老教程里的 completion 版
+        try? await cam.requestOpenSession()
 
         // 不用 delegate 等回调，直接给一点时间。会话没开成的话，
         // 后面第一条命令会回 SessionNotOpen —— 那也是我们要观察的结果之一。
@@ -192,23 +194,17 @@ final class CameraProbe: NSObject, ObservableObject {
         txn += 1
         let cmd = PTP.makeCommand(code: code, transaction: txn, params: params)
 
-        let raw: Data? = await withCheckedContinuation { cont in
-            cam.requestSendPTPCommand(
-                cmd,
-                outData: nil,
-                sendInstruction: true,
-                receiveYieldData: false
-            ) { resp, _, err in
-                if let err = err {
-                    self.log(.fail, "\(label) 发送失败", detail: err.localizedDescription)
-                    cont.resume(returning: nil)
-                    return
-                }
-                cont.resume(returning: resp)
-            }
+        // iOS 16+ 的 Swift 接口是 async 的，不是老教程里的 completion 版本。
+        // 网上大量示例还在用 sendInstruction:receiveYieldData:completion: 那套，
+        // 在 Swift 里编不过——只有 command 和 outData 两个参数。
+        let raw: Data
+        do {
+            let result = try await cam.requestSendPTPCommand(cmd, outData: nil)
+            raw = result.0
+        } catch {
+            log(.fail, "\(label) 发送失败", detail: error.localizedDescription)
+            return nil
         }
-
-        guard let raw = raw else { return nil }
         guard let parsed = PTP.parseResponse(raw) else {
             log(.warn, "\(label) 回了 \(raw.count) 字节，但不是标准响应容器",
                 detail: "前 16 字节：" + raw.prefix(16).map { String(format: "%02X", $0) }.joined(separator: " "))
@@ -220,11 +216,10 @@ final class CameraProbe: NSObject, ObservableObject {
     // MARK: - 小工具
 
     private func description(of cam: ICCameraDevice) -> String {
-        // 只用确定存在的属性。productKind / transportType 的类型在
-        // 不同 SDK 版本里可选性不一样，写死 if let 反而可能编不过。
+        // 只用确定存在的属性。productKind / transportType / isAccessRestricted
+        // 这几个在 iOS 上不一定有（有些是 macOS 专属），写上去反而编不过。
         var lines: [String] = []
         lines.append("会话已开：\(cam.hasOpenSession ? "是" : "否")")
-        lines.append("访问受限：\(cam.isAccessRestricted ? "是" : "否")")
         return lines.joined(separator: "\n")
     }
 
