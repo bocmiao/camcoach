@@ -26,13 +26,17 @@ Apple 不允许用 API 创建 API 密钥（自举问题），所以这一步绕�
 
 3. 页面上方切到 **`集成`**（`Integrations`）标签。
 
-4. 左侧选 **`App Store Connect API`**，右边区域标题附近有 **`团队密钥`**（`Team Keys`）。点 **`生成 API 密钥`**。
+4. 左侧选 **`App Store Connect API`**，右边区域标题附近有 **`团队密钥`**（`Team Keys`）。
 
-5. 弹窗只有两项：
+   **如果这里只有「请求访问权限」（`Request Access`）而不是「生成 API 密钥」**：点它，勾选条款，提交，等 Apple 审核通过后才能建密钥。第一次用 API 的账号都是这个状态——Apple 官方文档明确要求 Account Holder 先申请。这一步只有账号持有人能做（你自己的付费账号就是）。
+
+5. 点 **`生成 API 密钥`**（或右上角 `+`）。弹窗只有两项：
    - 名称：`camcoach-ci`
    - 访问权限：**App 经理**（`App Manager`）
 
-   不要选 `Developer`——那个角色读不了证书，也建不了描述文件。
+   两个别弄错：
+   - 不要选 `Developer`——读不了证书，后面 403。
+   - **不要用「个人 API 密钥」（Individual Key）**。Apple 文档写明个人密钥 `aren't able to use Provisioning endpoints`，建不了证书和描述文件。必须用 **团队密钥**。
 
 6. 生成后页面上会出现两个值：
 
