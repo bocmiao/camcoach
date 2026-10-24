@@ -30,13 +30,20 @@ step1() {
     esac
   fi
 
-  openssl genrsa -out "$CERT_DIR/private.key" 2048
+  # 关键：先 cd 进 cert 目录，后面所有 openssl 参数只用裸文件名，不带任何斜杠。
+  # 原因是 Git Bash 会「帮」你把看起来像路径的参数在 POSIX 和 Windows 格式之间转换，
+  # 而这个转换在不同启动方式下（直接在 Git Bash 里跑 / 从 cmd 调起来）行为不一致，
+  # 会导致 genrsa 能写、req 却读不到同一个文件。裸文件名没有斜杠，转换无从下手。
+  mkdir -p "$CERT_DIR"
+  cd "$CERT_DIR"
+
+  openssl genrsa -out private.key 2048
   echo "  私钥 → cert/private.key"
 
-  # MSYS_NO_PATHCONV 是必须的：不加的话 Git Bash 会把 /CN=... 当成路径改写掉
-  MSYS_NO_PATHCONV=1 openssl req -new \
-    -key "$CERT_DIR/private.key" \
-    -out "$CERT_DIR/request.crt" \
+  # -subj 里的 /CN=... 必须挡住路径转换，否则会被改写成 C:/Program Files/Git/CN=...
+  MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' openssl req -new \
+    -key private.key \
+    -out request.crt \
     -subj "/CN=CamCoach Distribution/O=CamCoach/C=CN"
   echo "  请求 → cert/request.crt"
   echo
@@ -64,26 +71,34 @@ step2() {
   [ -f "$CERT_DIR/distribution.cer" ]         || { echo "缺 cert/distribution.cer（从 Apple 下载的证书）"; exit 1; }
   [ -f "$CERT_DIR/distribution.mobileprovision" ] || { echo "缺 cert/distribution.mobileprovision（从 Apple 下载的描述文件）"; exit 1; }
 
+  cd "$CERT_DIR"
+
   # Apple 下载的是 DER 格式，openssl 要 PEM 才肯认
-  openssl x509 -inform DER -in "$CERT_DIR/distribution.cer" -out "$CERT_DIR/distribution.pem"
+  openssl x509 -inform DER -in distribution.cer -out distribution.pem
   echo "  证书 → cert/distribution.pem"
 
   echo
-  read -r -s -p "给这个 p12 设一个密码（等下要填进 GitHub Secrets，记牢）： " P12_PASS
-  echo
-  [ -n "$P12_PASS" ] || { echo "密码不能为空"; exit 1; }
+  echo "提示：如果下面这次输入没反应（cmd 里通过 bash 调用时偶尔会这样），"
+  echo "     可以先在 cmd 里执行  set P12_PASS=你的密码  然后再跑一次 step2。"
+  if [ -n "${P12_PASS:-}" ]; then
+    echo "  已从环境变量 P12_PASS 读到密码。"
+  else
+    read -r -s -p "给这个 p12 设一个密码（等下要填进 GitHub Secrets，记牢）： " P12_PASS || P12_PASS=""
+    echo
+  fi
+  [ -n "${P12_PASS:-}" ] || { echo "密码不能为空"; exit 1; }
 
   openssl pkcs12 -export \
-    -inkey "$CERT_DIR/private.key" \
-    -in "$CERT_DIR/distribution.pem" \
+    -inkey private.key \
+    -in distribution.pem \
     -name "CamCoach Distribution" \
-    -out "$CERT_DIR/distribution.p12" \
+    -out distribution.p12 \
     -passout "pass:$P12_PASS"
   echo "  打包 → cert/distribution.p12"
 
   # 全部转成 base64，GitHub Secrets 只吃纯文本
-  openssl base64 -A -in "$CERT_DIR/distribution.p12"              -out "$CERT_DIR/p12.b64"
-  openssl base64 -A -in "$CERT_DIR/distribution.mobileprovision"  -out "$CERT_DIR/profile.b64"
+  openssl base64 -A -in distribution.p12             -out p12.b64
+  openssl base64 -A -in distribution.mobileprovision -out profile.b64
 
   # 描述文件的"名字"要单独填，不在文件内容里，得从 plist 里挖
   PROFILE_NAME="$(security cms -D -i "$CERT_DIR/distribution.mobileprovision" 2>/dev/null \
