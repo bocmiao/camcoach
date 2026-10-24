@@ -220,11 +220,11 @@ final class CameraProbe: NSObject, ObservableObject {
     // MARK: - 小工具
 
     private func description(of cam: ICCameraDevice) -> String {
+        // 只用确定存在的属性。productKind / transportType 的类型在
+        // 不同 SDK 版本里可选性不一样，写死 if let 反而可能编不过。
         var lines: [String] = []
-        if let m = cam.productKind { lines.append("类型：\(m)") }
-        if let t = cam.transportType { lines.append("连接：\(t)") }
         lines.append("会话已开：\(cam.hasOpenSession ? "是" : "否")")
-        lines.append("可访问：\(cam.isAccessRestricted ? "受限" : "正常")")
+        lines.append("访问受限：\(cam.isAccessRestricted ? "是" : "否")")
         return lines.joined(separator: "\n")
     }
 
@@ -266,22 +266,58 @@ extension CameraProbe: ICDeviceBrowserDelegate {
         main { self.deviceLabel = "设备已断开" }
         log(.warn, "相机断开了")
     }
-
-    func deviceBrowserDidEnumerateLocalDevices(_ browser: ICDeviceBrowser) {
-        // 枚举结束。没设备就不要傻等 6 秒。
-        if camera == nil {
-            log(.info, "本地设备枚举结束，没有相机")
-        }
-    }
 }
 
 extension CameraProbe: ICCameraDeviceDelegate {
 
-    func cameraDevice(_ camera: ICCameraDevice, didReceiveOpenSessionError error: Error?) {
+    // ---- ICDeviceDelegate 的 required 三件套。
+    // ObjC 协议里这几个没标 @optional，Swift 少一个就报
+    // "type does not conform to protocol"，而且报错位置指向类型声明，
+    // 不指到具体缺哪个，得往上翻 note 才知道。
+
+    func didRemoveDevice(_ device: ICDevice) {
+        guard let cam = device as? ICCameraDevice, cam == camera else { return }
+        camera = nil
+        main { self.deviceLabel = "设备已移除" }
+    }
+
+    func device(_ device: ICDevice, didOpenSessionWithError error: Error?) {
         if let error = error {
             log(.fail, "打开会话失败", detail: error.localizedDescription)
         } else {
             log(.ok, "PTP 会话已打开")
+        }
+    }
+
+    func device(_ device: ICDevice, didCloseSessionWithError error: Error?) {
+        if let error = error {
+            log(.warn, "关闭会话时报错", detail: error.localizedDescription)
+        }
+    }
+
+    // ---- ICCameraDeviceDelegate 的 required 两个。
+    // 我们不下载缩略图和元数据（这一版只问参数），但协议要求必须实现，
+    // 空着即可。
+
+    func cameraDevice(
+        _ camera: ICCameraDevice,
+        didReceiveThumbnail thumbnail: CGImage?,
+        for item: ICCameraItem,
+        error: Error?
+    ) {}
+
+    func cameraDevice(
+        _ camera: ICCameraDevice,
+        didReceiveMetadata metadata: [AnyHashable: Any]?,
+        for item: ICCameraItem,
+        error: Error?
+    ) {}
+
+    // ---- 以下是 optional，实现了就能多看到点东西
+
+    func cameraDevice(_ camera: ICCameraDevice, didReceiveOpenSessionError error: Error?) {
+        if let error = error {
+            log(.fail, "相机会话打开出错", detail: error.localizedDescription)
         }
     }
 
