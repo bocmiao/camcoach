@@ -12,39 +12,146 @@ struct CheckRow: Identifiable {
 
 struct ContentView: View {
 
+    @StateObject private var probe = CameraProbe()
+    @State private var copied = false
+
     var body: some View {
         NavigationStack {
             List {
-                Section {
-                    ForEach(buildRows()) { r in
-                        HStack(alignment: .top, spacing: 12) {
-                            Image(systemName: r.ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                                .foregroundStyle(r.ok ? Color.green : Color.orange)
-                                .font(.system(size: 16))
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(r.label).font(.subheadline)
-                                Text(r.value)
-                                    .font(.caption)
+                deviceSection
+                selfCheckSection
+                logSection
+            }
+            .navigationTitle("取景助手 · 探针")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        UIPasteboard.general.string = probe.reportText
+                        copied = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                            copied = false
+                        }
+                    } label: {
+                        Label(copied ? "已复制" : "复制", systemImage: copied ? "checkmark" : "doc.on.doc")
+                    }
+                    .disabled(probe.logs.isEmpty)
+                }
+            }
+        }
+    }
+
+    // MARK: - 设备与探针
+
+    private var deviceSection: some View {
+        Section {
+            HStack(spacing: 12) {
+                Image(systemName: probe.running ? "dot.radiowaves.left.and.right" : "camera")
+                    .font(.system(size: 20))
+                    .foregroundStyle(probe.running ? Color.accentColor : Color.secondary)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(probe.deviceLabel).font(.subheadline.weight(.medium))
+                    Text(probe.phase).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .padding(.vertical, 2)
+
+            Button {
+                probe.begin()
+            } label: {
+                HStack {
+                    Spacer()
+                    if probe.running {
+                        ProgressView().padding(.trailing, 6)
+                    }
+                    Text(probe.running ? "正在探测…" : "开始探测")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                }
+            }
+            .disabled(probe.running)
+        } header: {
+            Text("相机")
+        } footer: {
+            Text("相机用数据线连 iPhone，连接方式选「遥控拍摄」（屏幕显示 -PC-），再点开始。")
+        }
+    }
+
+    // MARK: - 自检（v1.0 的内容，保留）
+
+    private var selfCheckSection: some View {
+        Section {
+            ForEach(buildRows()) { r in
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: r.ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                        .foregroundStyle(r.ok ? Color.green : Color.orange)
+                        .font(.system(size: 15))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(r.label).font(.subheadline)
+                        Text(r.value)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+        } header: {
+            Text("环境自检")
+        }
+    }
+
+    // MARK: - 日志
+
+    private var logSection: some View {
+        Section {
+            if probe.logs.isEmpty {
+                Text("还没有记录。点上面的「开始探测」。")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(probe.logs) { l in
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: l.icon)
+                            .font(.system(size: 12))
+                            .foregroundStyle(color(of: l.level))
+                            .padding(.top, 3)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(l.text)
+                                .font(.system(.caption, design: .monospaced))
+                                .fixedSize(horizontal: false, vertical: true)
+                            if let d = l.detail, !d.isEmpty {
+                                Text(d)
+                                    .font(.system(size: 11, design: .monospaced))
                                     .foregroundStyle(.secondary)
                                     .fixedSize(horizontal: false, vertical: true)
                             }
                         }
-                        .padding(.vertical, 2)
                     }
-                } header: {
-                    Text("自检")
-                } footer: {
-                    Text("这一版只验证一件事：没有 Mac，能不能把 App 装到你手机上。全绿就说明链路通了。")
-                }
-
-                Section("下一版才会接相机") {
-                    Text("枚举 USB 设备、发 PTP 命令、读拍摄参数、拉取景流——这些等自检全绿之后再进来，免得流水线问题和代码问题混在一起排查。")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+                    .padding(.vertical, 2)
                 }
             }
-            .navigationTitle("取景助手")
-            .navigationBarTitleDisplayMode(.inline)
+        } header: {
+            HStack {
+                Text("探测记录")
+                Spacer()
+                Text("\(probe.logs.count)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        } footer: {
+            if !probe.logs.isEmpty {
+                Text("右上角「复制」把整份记录贴给我，就知道下一步该做什么了。")
+            }
+        }
+    }
+
+    private func color(of level: ProbeLog.Level) -> Color {
+        switch level {
+        case .info: return .secondary
+        case .ok: return .green
+        case .fail: return .red
+        case .warn: return .orange
         }
     }
 
@@ -68,8 +175,7 @@ struct ContentView: View {
             ok: ptpOK
         ))
 
-        // 真引用一次这个类型，链接器才会真的去要 ImageCaptureCore。
-        // 如果框架在目标 SDK 里不可用，这一行会直接编译失败——那正是我要知道的事。
+        // 真引用一次，链接器才会真的去要 ImageCaptureCore。
         _ = ICCameraDevice.self
         out.append(CheckRow(
             label: "ImageCaptureCore",
