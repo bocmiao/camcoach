@@ -4,11 +4,11 @@
 
 给新手用的相机取景辅助工具。iPhone 用 USB 连上相机，实时看画面、读参数，画面对了不说话，不对了告诉你该改哪个数。
 
-**当前状态：v0.1.0 —— 只验证构建链路，还没有接入相机。**
+**当前状态：v1.0 (build 2) —— 已上传 TestFlight，无 Mac 构建链路全线打通。**
 
 这个版本唯一要证明的事：**没有 Mac，也能把 App 装到 iPhone 上**。界面上是一个自检清单，全绿就说明流水线通了。
 
-已实测通过的部分（`工程校验（免签名）` 流水线，不需要任何证书）：`project.yml` 能生成有效工程、Swift 代码编译通过、`CamCoach.app` 产物为真机架构、fastlane 可用。**待验证：签名与 TestFlight 上传**（需要配好 Secrets）。
+2026-10-24 实测走完的完整链路：验证 API 密钥 → 复用已有发布证书 → 导入 keychain → 安装描述文件 → XcodeGen 生成工程 → Archive → 导出 IPA → 上传 TestFlight，build 状态 `VALID`。全程在 Windows 上敲命令，没有 Mac。
 
 ---
 
@@ -32,8 +32,8 @@
 | 能力 | 状态 |
 |---|---|
 | 无 Mac 的 CI 构建链路 | ✅ 免签名编译已验证通过 |
-| 相机能力自检（系统版本 / PTP 通道 / ImageCaptureCore 链接） | ✅ v0.1.0 |
-| 签名 + 上传 TestFlight | ⬜ 等 Secrets 配好 |
+| 相机能力自检（系统版本 / PTP 通道 / ImageCaptureCore 链接） | ✅ v1.0 |
+| 签名 + 上传 TestFlight | ✅ build 2 状态 VALID |
 | USB 枚举相机、Sony 私有握手 | ⬜ v0.2.0 |
 | 读拍摄参数、写参数（含回读确认） | ⬜ v0.2.0 |
 | 取景流 + 像素级体检 | ⬜ v0.3.0 |
@@ -132,6 +132,15 @@ docs/why-apache.md          License 决策推导
 - **`security set-key-partition-list` 不能省。** 少了它，`codesign` 会弹 GUI 授权框，CI 里没人能点，任务挂到超时。
 - **运动模糊别用互相关测速度。** 画面里一个小主体 + 大片静止背景时，互相关永远返回 0，因为最匹配的位置确实是"没动"。改用帧差质心：主体离开处变亮、到达处变暗，两块的质心之差就是位移。
 - **纯数学的结论要再过一层常识。** 按 `模糊 = 速度 × 快门` 反解，主体几乎不动时会推出"1/8 秒就够"——数学没错，手持必抖。所以要加 1/125 的手持下限。
+
+第一次上传 TestFlight 连踩四个坑，都发生在上传阶段，编译和签名全是绿的：
+
+- **p12 必须用 3DES + SHA1 MAC。** Python 的 `cryptography` 默认给 AES-256 + SHA256 MAC，openssl 读得懂，但 macOS 的 `security import` 报 `MAC verification failed (wrong password?)`——提示说密码错，其实密码是对的，是算法不认。用 `openssl pkcs12 -export -certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES -macalg sha1` 重新封装才行。
+- **必须有 App 图标。** 没有 asset catalog 会报 `90713 Missing CFBundleIconName` + `90022 Missing 120x120 icon`。光把 PNG 放进目录不够，`project.yml` 里还得有 `ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon`，否则图标不会被编进包。
+- **App ID 和 App 记录是两回事。** Developer 后台建的是 Identifier，TestFlight 要的是 App Store Connect 里的「App」记录。后者 Apple 没有 API，只能网页手动建一次。少了它会报 `Couldn't find app 'xxx' on the account`。
+- **版本号要和 App Store Connect 里的一致。** 包里写 0.1.0、ASC 里建的是 1.0，上传报 `409 ENTITY_ERROR.RELATIONSHIP.INVALID.INVALID_STATE`（buildUpload）。另外 build 号每次上传都得是没用过的。
+
+还有一个反直觉的：**这个 409 有时意味着上传其实成功了**——Apple 收下二进制后有几秒钟不在 builds 列表里，altool 自动重试时撞上"build 已存在"就报 409。所以看到这个错先去 builds 列表查，别直接重传（会造成重复上传）。
 
 Windows 上的三个坑（都是实际撞出来的）：
 
