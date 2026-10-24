@@ -217,11 +217,70 @@ def gen_key_and_csr():
     return key, key_pem, csr_pem
 
 
-def build_p12(key, cer_der, password):
-    from cryptography.hazmat.primitives.serialization import BestAvailableEncryption, pkcs12
+def build_p12(key, cer_der, password, warn=True):
+    """合成 .p12。
+
+    格式有讲究，别再改回去：
+      cryptography 默认给 AES-256 加密 + SHA256 MAC（PKCS#12 v1.1）。
+      openssl 能读，但 macOS 的 Security.framework 只认老的 3DES + SHA1 MAC，
+      `security import` 会报 "MAC verification failed during PKCS12 import
+      (wrong password?)" —— 提示语说密码错，其实密码是对的，是算法不认。
+      这个坑在 CI 里查了两轮才发现，所以这里优先走 openssl 精确指定算法。
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
     from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
 
     cert = x509.load_der_x509_certificate(cer_der)
+    key_pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+
+    tmpdir = tempfile.mkdtemp(prefix="camcoach-p12-")
+    try:
+        kp = os.path.join(tmpdir, "k.pem")
+        cp = os.path.join(tmpdir, "c.pem")
+        op = os.path.join(tmpdir, "o.p12")
+        with open(kp, "wb") as f:
+            f.write(key_pem)
+        with open(cp, "wb") as f:
+            f.write(cert_pem)
+
+        base = [
+            "openssl", "pkcs12", "-export",
+            "-inkey", kp, "-in", cp, "-out", op,
+            "-passout", "pass:" + password,
+            "-certpbe", "PBE-SHA1-3DES",
+            "-keypbe", "PBE-SHA1-3DES",
+            "-name", "CamCoach Distribution",
+        ]
+
+        # 先试完整版（OpenSSL 1.1.1+ 才有 -macalg）
+        for cmd in (base + ["-macalg", "sha1"], base):
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True)
+            except FileNotFoundError:
+                break
+            if r.returncode == 0 and os.path.exists(op):
+                with open(op, "rb") as f:
+                    return f.read()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # 没有 openssl，退回 cryptography 的默认格式。
+    # 文件本身没问题，但 macOS 的 security import 可能导不进去——先说清楚。
+    if warn:
+        info("提示：本机没有可用的 openssl，.p12 用默认算法生成")
+        info("      如果要拿去 macOS 的 CI 签名，建议装 openssl 后重跑")
+
+    from cryptography.hazmat.primitives.serialization import BestAvailableEncryption, pkcs12
+
     return pkcs12.serialize_key_and_certificates(
         name=b"CamCoach Distribution",
         key=key,

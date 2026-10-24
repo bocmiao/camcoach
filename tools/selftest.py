@@ -184,6 +184,25 @@ def main():
             bad_pw_ok = True
         check("错误密码读不出来（密码确实生效）", bad_pw_ok)
 
+        # 算法必须落在 macOS 认的范围里。
+        # cryptography 的默认值是 AES + SHA256，openssl 能读但 Security.framework
+        # 会报 "MAC verification failed (wrong password?)"——提示说密码错，其实是算法不认。
+        # 这两条断言就是防止有人把它改回默认值。
+        import subprocess
+
+        pr = subprocess.run(
+            ["openssl", "pkcs12", "-info", "-in", p12_path,
+             "-passin", "pass:" + pw, "-noout"],
+            capture_output=True, text=True,
+        )
+        desc = (pr.stdout + pr.stderr).lower()
+        if pr.returncode == 0:
+            check("p12 的 MAC 是 SHA1（macOS 只认这个）", "sha1" in desc, desc[:200])
+            check("p12 的加密是 3DES（macOS 只认这个）",
+                  "tripledes" in desc or "3-keytripledes" in desc, desc[:200])
+        else:
+            check("openssl 能读出 p12 的结构", False, (pr.stderr or "")[:200])
+
         # ---------------------------------------------------------- 4. 全流程
         print()
         print("  4. 六步流程编排（mock 掉 Apple 的响应）")
