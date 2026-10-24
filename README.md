@@ -105,6 +105,28 @@ make-cert step2
 
 </details>
 
+### 一条命令发版
+
+`tools/ship.py` 把整条链路收进一个入口：
+
+```bash
+python tools/ship.py doctor      # 体检，只读，先跑这个
+python tools/ship.py setup       # 首次：证书 + p12 + Bundle ID + 描述文件
+python tools/ship.py secrets     # 把 secrets 写进 GitHub
+python tools/ship.py release     # 发版：build号+1 → 推送 → 构建 → 挂测试组
+python tools/ship.py status      # 分发状态速查
+```
+
+Windows 上双击 `tools\ship.cmd`，它会自己找 Python。
+
+**`doctor` 为什么重要**：iOS 这条链的失败总发生在**最后一步**——编译、签名、导出全绿，上传时才说版本号不对；或者上传明明成功了，TestFlight 里却是空的（没分配测试组）。`doctor` 把"最后一秒才炸的失败"提前到"第一秒"，并且直接给出修法。
+
+它还会查出一些你不一定知道的事，比如：
+
+- 账号下的 Distribution 证书已经用掉几张（团队上限 2 张，满了就只能复用，不能再申请）
+- 下一个 build 号会不会撞（撞了上传必被拒）
+- App 名字里有没有第三方商标（内部测试没事，外部测试和上架必被拒）
+
 ### 触发构建
 
 **上传流水线只能手动触发**（`gh workflow run ios.yml --ref main`，或在 Actions 页面点 Run workflow）。
@@ -170,6 +192,10 @@ CamCoach/
 fastlane/Fastfile           仅负责上传 TestFlight
 tools/apple-auto.py         一站式：证书 + Bundle ID + 描述文件全部走 API 自动生成
 tools/apple-auto.cmd        Windows 双击入口
+tools/ship.py               统一入口：doctor / setup / secrets / release / status
+tools/ship.cmd              Windows 双击入口（纯 ASCII）
+tools/ship.py               统一入口：doctor / setup / secrets / release / status
+tools/ship.cmd              Windows 双击入口（纯 ASCII，自己找 Python）
 tools/testflight.py         上传后收尾：内部测试组 + 挂 build + 加测试员
 tools/selftest.py           上面那个脚本的离线自测（41 项）
 tools/make-ios-cert.sh      手动路径：纯 openssl 生成证书

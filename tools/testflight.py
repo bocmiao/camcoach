@@ -69,9 +69,22 @@ def load_apple_auto():
     return mod
 
 
-def read_secrets():
-    """读 cert/secrets.txt。找不到就返回空字典，让参数兜底。"""
-    for cand in (HERE.parent / "cert" / "secrets.txt", HERE / "secrets.txt"):
+def read_secrets(cert_dir=None):
+    """读 secrets.txt。找不到就返回空字典，让参数兜底。
+
+    cert_dir 优先。不给的话按几个常见位置试——注意 apple-auto.py 的
+    `--out` 默认是 `tools/cert`，所以它自己生成的文件在那儿；
+    但也有人把 cert 放在项目外（不把私钥材料放仓库里，更稳妥）。
+    """
+    cands = []
+    if cert_dir:
+        cands.append(Path(cert_dir) / "secrets.txt")
+    cands += [
+        HERE / "cert" / "secrets.txt",        # apple-auto.py 默认输出位置
+        HERE.parent / "cert" / "secrets.txt",  # ios/cert
+        HERE / "secrets.txt",
+    ]
+    for cand in cands:
         if cand.exists():
             out = {}
             for line in cand.read_text(encoding="utf-8").splitlines():
