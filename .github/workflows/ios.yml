@@ -146,7 +146,7 @@ jobs:
             <key>stripSwiftSymbols</key><true/>
             <key>provisioningProfiles</key>
             <dict>
-              <key>com.camcoach.app</key><string>${PROFILE_NAME}</string>
+              <key>com.bocmiao.camcoach</key><string>${PROFILE_NAME}</string>
             </dict>
           </dict>
           </plist>

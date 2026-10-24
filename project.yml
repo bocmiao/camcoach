@@ -6,7 +6,7 @@
 name: CamCoach
 
 options:
-  bundleIdPrefix: com.camcoach
+  bundleIdPrefix: com.bocmiao
   deploymentTarget:
     iOS: "16.0"
   createIntermediateGroups: true
@@ -42,7 +42,7 @@ targets:
 
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.camcoach.app
+        PRODUCT_BUNDLE_IDENTIFIER: com.bocmiao.camcoach
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
         # 手动签名：证书和 profile 都由 CI 从 secrets 导入，不让 Xcode 自己去要
