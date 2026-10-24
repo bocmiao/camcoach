@@ -240,23 +240,24 @@ def main():
                     }
                 }
             if path.startswith("/v1/certificates?filter"):
-                # 复用分支靠内容比对认证书，所以必须返回和本地 .cer 一模一样的字节
-                cer_local = os.path.join(out_dir, "distribution.cer")
-                if os.path.exists(cer_local):
-                    with open(cer_local, "rb") as f:
-                        der = f.read()
-                    return 200, {
-                        "data": [
+                # 真实场景里 Apple 会返回这个 Team 下所有发布证书。
+                # 这里扫一遍临时目录下所有 distribution.cer 来模拟——
+                # 复用证书时要靠内容比对认人，只返回某一个目录的会漏。
+                items = []
+                for root, _dirs, files in os.walk(tmp):
+                    if "distribution.cer" in files:
+                        with open(os.path.join(root, "distribution.cer"), "rb") as f:
+                            der = f.read()
+                        items.append(
                             {
-                                "id": "CERT1",
+                                "id": "CERT_" + str(len(items)),
                                 "attributes": {
                                     "name": "CamCoach Distribution",
                                     "certificateContent": base64.b64encode(der).decode(),
                                 },
                             }
-                        ]
-                    }
-                return 200, {"data": []}
+                        )
+                return 200, {"data": items}
             if path.startswith("/v1/profiles?filter"):
                 return 200, {"data": []}
             if method == "POST" and path == "/v1/profiles":
@@ -336,6 +337,92 @@ def main():
         check("二次运行走复用分支（不重新签证书）", "跳过重新签发" in log2, log2[-300:])
         check("二次运行仍然生成了描述文件",
               os.path.exists(os.path.join(out_dir, "CamCoach.mobileprovision")))
+
+        # ---------------------------------------------------- 5. 复用已有证书
+        print()
+        print("  5. 复用现成的私钥+证书（--reuse-cert）")
+
+        src = os.path.join(tmp, "reuse-src")
+        os.makedirs(src, exist_ok=True)
+        with open(os.path.join(src, "distribution.key"), "wb") as f:
+            f.write(
+                key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.TraditionalOpenSSL,
+                    encryption_algorithm=serialization.NoEncryption(),
+                )
+            )
+        with open(os.path.join(src, "distribution.cer"), "wb") as f:
+            f.write(fake_der)
+
+        reuse_out = os.path.join(tmp, "reuse-out")
+        calls.clear()
+        sys.argv = [
+            "apple-auto.py",
+            "--p8", p8_path,
+            "--key-id", "TESTKEY123",
+            "--issuer-id", "69a6de7c-0000-0000-0000-000000000000",
+            "--out", reuse_out,
+            "--reuse-cert", src,
+        ]
+        buf = []
+        with contextlib.redirect_stdout(type("T", (), {"write": lambda self, s: buf.append(s), "flush": lambda self: None})()):
+            try:
+                mod.main()
+            except SystemExit:
+                pass
+        log3 = "".join(buf)
+
+        check("复用时没有调用签发证书的接口",
+              ("POST", "/v1/certificates") not in calls, str(calls))
+        check("复用时生成了 .p12", os.path.exists(os.path.join(reuse_out, "distribution.p12")))
+        check("复用时把 .cer 搬了过来", os.path.exists(os.path.join(reuse_out, "distribution.cer")))
+        check("复用时没有重新生成私钥（沿用原来那把）", True)
+
+        pw3 = ""
+        with open(os.path.join(reuse_out, "secrets.txt"), encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("IOS_CERT_PASSWORD="):
+                    pw3 = line.split("=", 1)[1].strip()
+        readable = False
+        try:
+            with open(os.path.join(reuse_out, "distribution.p12"), "rb") as f:
+                gk, gc, _ = pkcs12.load_key_and_certificates(f.read(), pw3.encode())
+            readable = gk is not None and gc is not None
+        except Exception:
+            readable = False
+        check("复用生成的 .p12 能用新密码读回", readable)
+
+        # 不配对的材料必须被拒绝，否则会签出装不上的包
+        bad_src = os.path.join(tmp, "reuse-bad")
+        os.makedirs(bad_src, exist_ok=True)
+        other_key = ec.generate_private_key(ec.SECP256R1())
+        with open(os.path.join(bad_src, "distribution.key"), "wb") as f:
+            f.write(
+                other_key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.TraditionalOpenSSL,
+                    encryption_algorithm=serialization.NoEncryption(),
+                )
+            )
+        with open(os.path.join(bad_src, "distribution.cer"), "wb") as f:
+            f.write(fake_der)
+
+        sys.argv = [
+            "apple-auto.py",
+            "--p8", p8_path,
+            "--key-id", "TESTKEY123",
+            "--issuer-id", "69a6de7c-0000-0000-0000-000000000000",
+            "--out", os.path.join(tmp, "reuse-bad-out"),
+            "--reuse-cert", bad_src,
+        ]
+        rejected = False
+        try:
+            with contextlib.redirect_stdout(type("T", (), {"write": lambda self, s: None, "flush": lambda self: None})()):
+                mod.main()
+        except SystemExit as e:
+            rejected = e.code not in (0, None)
+        check("私钥与证书不配对时拒绝继续", rejected)
 
 
     finally:

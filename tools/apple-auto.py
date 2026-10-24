@@ -298,6 +298,12 @@ def main():
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "cert"))
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument(
+        "--reuse-cert",
+        default="",
+        metavar="DIR",
+        help="复用已有的一套私钥+证书（目录里要有 distribution.key 和 distribution.cer），不重新签发",
+    )
     args = ap.parse_args()
 
     require_crypto()
@@ -375,16 +381,24 @@ def main():
     if status == 401:
         die(
             "API Key 被拒（401）",
-            "三个可能，按顺序自查：\n"
-            "  1. Key ID 或 Issuer ID 抄错了（Issuer ID 是 UUID，带横杠）\n"
-            "  2. 这个 .p8 不是 App Store Connect API 的密钥\n"
-            "  3. 密钥已被吊销（在后台能看到状态）",
+            "四个可能，按可能性排序：\n"
+            "  1. 这个 .p8 是「推送密钥」不是「API 密钥」\n"
+            "     两种文件都叫 AuthKey_XXXXXXXXXX.p8，扩展名和内容格式一模一样，\n"
+            "     光看文件分不出来。推送密钥在 developer.apple.com/account -> Keys 生成，\n"
+            "     勾的是 Apple Push Notifications；API 密钥在 appstoreconnect.apple.com\n"
+            "     -> 用户和访问 -> 集成 -> App Store Connect API 生成。\n"
+            "  2. Key ID 或 Issuer ID 抄错了（Issuer ID 是 UUID，带横杠，别只抄前半段）\n"
+            "  3. 这个 .p8 属于另一个开发者账号，Issuer ID 却是这个账号的——两者必须同属一个 Team\n"
+            "  4. 密钥已被吊销（后台能看到状态变成 Revoked）",
         )
     if status == 403:
         die(
-            "API Key 有效但没有权限（403）",
+            "API Key 有效，但没有权限（403）",
             "建密钥时 Access 要选 App Manager 或 Admin。\n"
-            "Developer 角色读不了证书，也建不了描述文件。",
+            "Developer 角色读不了证书，也建不了描述文件。\n\n"
+            "另外确认你用的是「团队密钥」（Team Key），不是「个人密钥」（Individual Key）。\n"
+            "Apple 文档写明个人密钥不能用 Provisioning endpoints——建不了证书和描述文件。\n"
+            "两者名字很像，选错要走到后面才报错。",
         )
     if status != 200:
         die("鉴权请求失败（HTTP " + str(status) + "）", api_err(payload))
@@ -405,7 +419,18 @@ def main():
 
     if args.check:
         print()
-        print("  --check 模式，到此为止。API Key 是好的，可以正式跑了。")
+        print("  " + "=" * 54)
+        print("  这个密钥能用")
+        print("  " + "=" * 54)
+        print()
+        print("  它属于这个开发者账号，Team ID：")
+        print("      " + (team_id if team_id else "（取不到，不影响使用）"))
+        print()
+        print("  核对一下这是不是你要打包的那个账号。")
+        print("  如果你本来就是从别的项目留下的密钥，只要属于同一个账号就正好——")
+        print("  团队密钥对整个 Team 下所有 App 通用，不必重新建。")
+        print()
+        print("  确认没问题就去掉 --check 再跑一次，会开始签证书。")
         print()
         return
 
@@ -417,18 +442,97 @@ def main():
     p12_path = os.path.join(out, "distribution.p12")
 
     cert_id = None
+    p12_password = ""
     reuse = (not args.force) and os.path.exists(key_path) and os.path.exists(p12_path)
+
+    # --reuse-cert：搬一套现成的私钥+证书进来，跳过签发。
+    # 理由：发布证书是 Team 级的，一张能签这个 Team 下所有 App；
+    # 而 Apple 只给 2 张名额，能复用就不该重签。
+    if args.reuse_cert and not reuse:
+        from cryptography import x509 as _x509
+        from cryptography.hazmat.primitives import serialization as _ser
+
+        src_dir = os.path.abspath(args.reuse_cert)
+        src_key = os.path.join(src_dir, "distribution.key")
+        src_cer = os.path.join(src_dir, "distribution.cer")
+        for p_ in (src_key, src_cer):
+            if not os.path.exists(p_):
+                die(
+                    "复用目录里缺文件：" + p_,
+                    "这个目录要同时有 distribution.key 和 distribution.cer。\n"
+                    "叫别的名字也行，改过来即可——必须是这一对。",
+                )
+
+        with open(src_key, "rb") as f:
+            _key_pem = f.read()
+        try:
+            _key = _ser.load_pem_private_key(_key_pem, password=None)
+        except Exception as e:
+            die("读不了私钥：" + str(e), "私钥可能加了密码，先解开再放进来。")
+
+        with open(src_cer, "rb") as f:
+            _cer_raw = f.read()
+        try:
+            _cert = _x509.load_der_x509_certificate(_cer_raw)
+        except Exception:
+            try:
+                _cert = _x509.load_pem_x509_certificate(_cer_raw)
+            except Exception as e:
+                die("读不了证书：" + str(e))
+
+        def _spki(pub):
+            return pub.public_bytes(_ser.Encoding.DER, _ser.PublicFormat.SubjectPublicKeyInfo)
+
+        if _spki(_cert.public_key()) != _spki(_key.public_key()):
+            die(
+                "这套私钥和证书不是一对，配不上。",
+                "用不配对的材料签出来的包，装机会报签名无效。\n"
+                "去掉 --reuse-cert，让脚本重新签一张。",
+            )
+
+        import datetime as _dt
+
+        cer_der = _cert.public_bytes(_ser.Encoding.DER)
+        with open(key_path, "wb") as f:
+            f.write(_key_pem)
+        with open(cer_path, "wb") as f:
+            f.write(cer_der)
+
+        ok("复用已有私钥和证书（没重新签发，不占证书名额）")
+        try:
+            _cn = _cert.subject.get_attributes_for_oid(_x509.oid.NameOID.COMMON_NAME)[0].value
+            info("证书：" + _cn)
+        except Exception:
+            pass
+        try:
+            _ou = _cert.subject.get_attributes_for_oid(_x509.oid.NameOID.ORGANIZATIONAL_UNIT_NAME)[0].value
+            info("Team ID：" + _ou)
+        except Exception:
+            pass
+        _end = getattr(_cert, "not_valid_after_utc", None)
+        if _end is not None:
+            _days = (_end - _dt.datetime.now(_dt.timezone.utc)).days
+            info("到期：" + _end.date().isoformat() + "（还剩 " + str(_days) + " 天）")
+            if _days < 30:
+                info("快过期了，建议改成 --force 重签一张")
+
+        p12_password = rand_password()
+        with open(p12_path, "wb") as f:
+            f.write(build_p12(_key, cer_der, p12_password))
+        ok(".p12 已用新密码重新合成")
+        reuse = True
+
     if reuse:
-        ok("cert/ 里已有证书和私钥，跳过重新签发")
-        info("（想强制重签就加 --force）")
-        p12_password = ""
-        # 复用模式下密码无从得知，让用户从上次的 secrets.txt 里读
-        sec_path = os.path.join(out, "secrets.txt")
-        if os.path.exists(sec_path):
-            with open(sec_path, encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("IOS_CERT_PASSWORD="):
-                        p12_password = line.split("=", 1)[1].strip()
+        if not p12_password:
+            ok("cert/ 里已有证书和私钥，跳过重新签发")
+            info("（想强制重签就加 --force）")
+            # 复用模式下密码无从得知，让用户从上次的 secrets.txt 里读
+            sec_path = os.path.join(out, "secrets.txt")
+            if os.path.exists(sec_path):
+                with open(sec_path, encoding="utf-8") as f:
+                    for line in f:
+                        if line.startswith("IOS_CERT_PASSWORD="):
+                            p12_password = line.split("=", 1)[1].strip()
         # 描述文件必须绑定「本地私钥对应的那张证书」的 id，
         # 随便挑一张会让打包时签名对不上。所以上一轮跑完时把 id 存了下来。
         cid_path = os.path.join(out, "cert-id.txt")
@@ -556,6 +660,12 @@ def main():
                 if c and local_der and base64.b64decode(c) == local_der:
                     cert_id = it.get("id")
                     info("按证书内容匹配到本地私钥对应的那张")
+                    # 存下来，下次就不用再扫一遍列表了
+                    try:
+                        with open(os.path.join(out, "cert-id.txt"), "w", encoding="utf-8") as f:
+                            f.write(cert_id)
+                    except Exception:
+                        pass
                     break
     if not cert_id:
         die(
