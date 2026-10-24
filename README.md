@@ -4,9 +4,11 @@
 
 给新手用的相机取景辅助工具。iPhone 用 USB 连上相机，实时看画面、读参数，画面对了不说话，不对了告诉你该改哪个数。
 
-**当前状态：v1.0 (build 2) —— 已上传 TestFlight，无 Mac 构建链路全线打通。**
+**当前状态：v1.0 (build 4) —— 已上传 TestFlight，状态 `VALID`，带相机探针。**
 
-这个版本唯一要证明的事：**没有 Mac，也能把 App 装到 iPhone 上**。界面上是一个自检清单，全绿就说明流水线通了。
+build 4 要回答一个问题：**iPhone 到底能不能通过 USB 跟 A7M4 说上话**。装上后把相机切到「遥控拍摄」（屏幕显示 `-PC-`），点「开始探测」，它会依次试标准 PTP 和 Sony 的那几个逆向私有命令码，每一步的返回码都原样记下来，最后「复制」出一份报告。
+
+探针的设计原则是**只观察、不假设**：所有 Sony 私有码都没有官方文档，写死一条「正确流程」的话，第一个错误就会把后面全挡住。所以每个码单独发、单独记，`OperationNotSupported` 本身也是有用信息——它至少证明通道通了、只是码不对。
 
 2026-10-24 实测走完的完整链路：验证 API 密钥 → 复用已有发布证书 → 导入 keychain → 安装描述文件 → XcodeGen 生成工程 → Archive → 导出 IPA → 上传 TestFlight，build 状态 `VALID`。全程在 Windows 上敲命令，没有 Mac。
 
@@ -32,10 +34,10 @@
 | 能力 | 状态 |
 |---|---|
 | 无 Mac 的 CI 构建链路 | ✅ 免签名编译已验证通过 |
-| 相机能力自检（系统版本 / PTP 通道 / ImageCaptureCore 链接） | ✅ v1.0 |
-| 签名 + 上传 TestFlight | ✅ build 2 状态 VALID |
-| USB 枚举相机、Sony 私有握手 | ⬜ v0.2.0 |
-| 读拍摄参数、写参数（含回读确认） | ⬜ v0.2.0 |
+| 相机能力自检（系统版本 / PTP 通道 / ImageCaptureCore 链接） | ✅ build 2 |
+| 签名 + 上传 TestFlight | ✅ build 4 状态 VALID |
+| USB 枚举相机、Sony 私有握手 | 🔬 build 4 探针，待真机结果 |
+| 读拍摄参数、写参数（含回读确认） | ⬜ 等探针结论 |
 | 取景流 + 像素级体检 | ⬜ v0.3.0 |
 | 意图预设 + 越线一键修正 | ⬜ v0.4.0 |
 
@@ -43,10 +45,19 @@
 
 | 流水线 | 需要 Secrets | 什么时候跑 |
 |---|---|---|
-| **工程校验（免签名）** | ❌ 不需要 | 改代码时自动跑。用 `CODE_SIGNING_ALLOWED=NO` 跳过签名，只验工程生成 + 编译 + fastlane |
-| **iOS 构建并上传 TestFlight** | ✅ 需要 | 推 main 或手动触发。签名、导出 ipa、上传 |
+| **工程校验（免签名）** | ❌ 不需要 | 每次 push 自动跑。用 `CODE_SIGNING_ALLOWED=NO` 跳过签名，只验工程生成 + 编译 + fastlane |
+| **iOS 构建并上传 TestFlight** | ✅ 需要 | **只能手动触发**（`workflow_dispatch`）。签名、导出 ipa、上传 |
 
 分开的原因：签名问题（证书、profile、scope）和代码问题需要分开排查。混在一条流水线里，一个编译错误会被前面的签名失败挡住，看不到。
+
+**上传这条为什么必须手动触发**：早期它挂在 `push` 上，结果改文档、改注释、甚至提交一版编不过的 Swift，都会自动跑完签名 + 上传，白烧一个 build 号。连着三次提交就吃掉 1/2/3，其中 build 1 根本编译不过也照样占了号。等真要发可用的包时被 Apple 拒：
+
+```
+ENTITY_ERROR.ATTRIBUTE.INVALID.DUPLICATE
+The bundle version must be higher than the previously uploaded version: '3'
+```
+
+**上传不可撤销，占掉的号拿不回来。** 所以现在改成：改 `project.yml` 里的 `CURRENT_PROJECT_VERSION` → 手动点运行。日常改代码只走校验流水线，不花 build 号。
 
 ---
 
