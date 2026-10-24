@@ -43,8 +43,12 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.bocmiao.camcoach
-        MARKETING_VERSION: "0.1.0"
-        CURRENT_PROJECT_VERSION: "1"
+        # 必须和 App Store Connect 里建的那个版本对上。
+        # 包里写 0.1.0、ASC 里是 1.0，上传会报
+        # 409 ENTITY_ERROR.RELATIONSHIP.INVALID.INVALID_STATE（buildUpload）。
+        MARKETING_VERSION: "1.0"
+        # 每次上传都要是一个没被用过的号，Apple 不接受重复的 build 号
+        CURRENT_PROJECT_VERSION: "2"
         # 手动签名：证书和 profile 都由 CI 从 secrets 导入，不让 Xcode 自己去要
         CODE_SIGN_STYLE: Manual
         TARGETED_DEVICE_FAMILY: "1"
