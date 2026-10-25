@@ -2,11 +2,13 @@
 
 [![工程校验](https://github.com/bocmiao/camcoach/actions/workflows/validate.yml/badge.svg)](https://github.com/bocmiao/camcoach/actions/workflows/validate.yml)
 
-给新手用的相机取景辅助工具。iPhone 用 USB 连上相机，实时看画面、读参数，画面对了不说话，不对了告诉你该改哪个数。
+给新手用的相机使用助手。iPhone 用 USB 连上相机，认键、找设置、照着预设拨参数；探针跑通之后，再往里加实时画面反馈。
 
-**当前状态：v1.0 (build 4) —— 已上传 TestFlight，状态 `VALID`，带相机探针。**
+**当前状态：build 6 —— 已上传 TestFlight，状态 `VALID`。含 23 个按键图鉴、12 条菜单反查、5 组预设、第一周上手清单。**
 
-build 4 要回答一个问题：**iPhone 到底能不能通过 USB 跟 A7M4 说上话**。装上后把相机切到「遥控拍摄」（屏幕显示 `-PC-`），点「开始探测」，它会依次试标准 PTP 和 Sony 的那几个逆向私有命令码，每一步的返回码都原样记下来，最后「复制」出一份报告。
+build 6 补的是「认识这台机器」。五个视角的机身图，点一下看这个键是干什么的、默认值是什么、什么时候该改、新手最容易搞错什么。这些内容原本只存在于网页原型里。
+
+相机那条线还停在探针。build 4 的探测页要回答一个问题：**iPhone 到底能不能通过 USB 跟 A7M4 说上话**。装上后把相机切到「遥控拍摄」（屏幕显示 `-PC-`），点「开始探测」，它会依次试标准 PTP 和 Sony 的那几个逆向私有命令码，每一步的返回码都原样记下来，最后「复制」出一份报告。
 
 探针的设计原则是**只观察、不假设**：所有 Sony 私有码都没有官方文档，写死一条「正确流程」的话，第一个错误就会把后面全挡住。所以每个码单独发、单独记，`OperationNotSupported` 本身也是有用信息——它至少证明通道通了、只是码不对。
 
@@ -16,16 +18,20 @@ build 4 要回答一个问题：**iPhone 到底能不能通过 USB 跟 A7M4 说�
 
 ## 为什么有这个东西
 
-市面上的相机教程、按键说明、参数预设，随便一搜到处都是。写一本更好的说明书，没有意义。
+新手卡住的地方有两处，顺序是固定的。
 
-真正缺的是**画面上正在发生的错**：主体在跑、快门还停在 1/60、这一张注定糊——相机自己不会说，说明书也不会当场说。
+**第一处是根本不认识手上的机器。** 模式盘该停哪档、C1 和 C3 谁管对焦区域、快门声音在哪个菜单里关——这些说明书都写了，但写在几百页 PDF 里，按 Sony 的功能分类排，跟脑子里的问法对不上。
 
-所以这个 App 不做内容库，做到两件事：
+**第二处是拍的时候不知道自己错了。** 主体在跑、快门还停在 1/60、这一张注定糊。相机自己不会说，说明书也不会当场说。
 
-1. **预设**：你说"我想拍成背景虚化的人像"，它把整套参数（档位、光圈、快门下限、对焦模式、对焦区域、白平衡）写进相机。你不用知道光圈该是多少。
-2. **体检**：从取景流里算直方图、锐度、主体位移，预测这张会不会糊。越线了就说，没越线就闭嘴。
+App 按这个顺序做：
 
-全部在本地算，不上传任何画面，不需要联网，也不调大模型。
+1. **认机器**：按键图鉴、菜单反查、预设、上手清单。全部离线，看一遍能上手。
+2. **当场纠错**：从取景流里算直方图、锐度、主体位移，预测这张会不会糊。越线了就说，没越线就闭嘴。这一步要等探针先证明能拿到画面。
+
+不做问答机器人。问题库随便一搜都有，答得再全也不如指着机身上那个键告诉你它在哪。
+
+实时反馈全部在本地算，不上传任何画面，不需要联网，也不调大模型。
 
 ---
 
@@ -34,12 +40,15 @@ build 4 要回答一个问题：**iPhone 到底能不能通过 USB 跟 A7M4 说�
 | 能力 | 状态 |
 |---|---|
 | 无 Mac 的 CI 构建链路 | ✅ 免签名编译已验证通过 |
+| 按键图鉴（5 个视角 / 23 个键 / 14 个字段） | ✅ build 6 |
+| 菜单反查（12 条，可搜可复制路径） | ✅ build 6 |
+| 预设（5 组，含分步操作） | ✅ build 6 |
+| 第一周上手清单（16 个键，勾选存本地） | ✅ build 6 |
 | 相机能力自检（系统版本 / PTP 通道 / ImageCaptureCore 链接） | ✅ build 2 |
-| 签名 + 上传 TestFlight | ✅ build 4 状态 VALID |
+| 签名 + 上传 TestFlight | ✅ build 6 状态 VALID |
 | USB 枚举相机、Sony 私有握手 | 🔬 build 4 探针，待真机结果 |
 | 读拍摄参数、写参数（含回读确认） | ⬜ 等探针结论 |
-| 取景流 + 像素级体检 | ⬜ v0.3.0 |
-| 意图预设 + 越线一键修正 | ⬜ v0.4.0 |
+| 取景流 + 像素级体检 | ⬜ 等探针结论 |
 
 ## 两条流水线
 
@@ -114,6 +123,7 @@ python tools/ship.py doctor      # 体检，只读，先跑这个
 python tools/ship.py setup       # 首次：证书 + p12 + Bundle ID + 描述文件
 python tools/ship.py secrets     # 把 secrets 写进 GitHub
 python tools/ship.py release     # 发版：build号+1 → 推送 → 构建 → 挂测试组
+python tools/ship.py logs        # 构建失败时把日志压到能读的长度
 python tools/ship.py status      # 分发状态速查
 ```
 
@@ -184,20 +194,36 @@ echo "密码末字符: ${CERT_PASSWORD: -1}"
 project.yml                 工程描述（XcodeGen）
 CamCoach/
   CamCoachApp.swift         入口
-  ContentView.swift         自检页
+  RootView.swift            五个 tab，数据加载失败页
+  Model/
+    CameraData.swift        内容数据的 Codable 结构
+    GuideProgress.swift     上手清单的勾选进度（UserDefaults）
+  Guide/
+    BodyDiagram.swift       五个视角的机身图 + 23 个热区
+    BodyDiagramView.swift   图鉴页，机身图与列表双向联动
+    ButtonDetailView.swift  单个按键的 14 个字段
+    MenuSearchView.swift    菜单反查
+    PresetListView.swift    预设与分步操作
+    ChecklistView.swift     第一周认键清单
+  Probe/
+    ProbeView.swift         连相机 + 连接前 6 项检查
+    CameraProbe.swift       PTP 会话与探测流程
+    PTP.swift               PTP 容器编解码
+  Resources/
+    camcoach-data.json      打包进 App 的内容数据（生成产物，不改它）
   Info.plist                由 project.yml 生成，不入库
+data/guide-source.json      按键文案源
+tools/build-guide-data.py   生成上面那个 JSON
 .github/workflows/
   ios.yml                   签名 + 构建 + 上传 TestFlight
   validate.yml              免签名校验（不需要证书，改代码就自动跑）
 fastlane/Fastfile           仅负责上传 TestFlight
 tools/apple-auto.py         一站式：证书 + Bundle ID + 描述文件全部走 API 自动生成
 tools/apple-auto.cmd        Windows 双击入口
-tools/ship.py               统一入口：doctor / setup / secrets / release / status
-tools/ship.cmd              Windows 双击入口（纯 ASCII）
-tools/ship.py               统一入口：doctor / setup / secrets / release / status
+tools/ship.py               统一入口：doctor / setup / secrets / release / logs / status
 tools/ship.cmd              Windows 双击入口（纯 ASCII，自己找 Python）
 tools/testflight.py         上传后收尾：内部测试组 + 挂 build + 加测试员
-tools/selftest.py           上面那个脚本的离线自测（41 项）
+tools/selftest.py           上面那个脚本的离线自测（91 项）
 tools/make-ios-cert.sh      手动路径：纯 openssl 生成证书
 make-cert.cmd               手动路径的 Windows 入口
 docs/cert-guide.md          证书与 Secrets 的完整操作说明
