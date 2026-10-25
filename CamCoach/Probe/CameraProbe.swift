@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import Foundation
 import ImageCaptureCore
+import UIKit
 
 struct ProbeLog: Identifiable {
     enum Level {
@@ -38,10 +39,11 @@ final class CameraProbe: NSObject, ObservableObject {
     @Published private(set) var running = false
     @Published private(set) var phase = "未开始"
     @Published private(set) var deviceLabel = "未发现设备"
+    /// 探针抓到的第一帧取景，用来证明这条链路真的能出画面。
+    @Published private(set) var previewFrame: UIImage?
 
     private let browser = ICDeviceBrowser()
     private var camera: ICCameraDevice?
-    private var txn: UInt32 = 0
     private var found = false
 
     override init() {
@@ -60,6 +62,7 @@ final class CameraProbe: NSObject, ObservableObject {
             self.logs.removeAll()
             self.phase = "搜索设备"
             self.deviceLabel = "搜索中…"
+            self.previewFrame = nil
             self.found = false
         }
         log(.info, "开始搜索 USB 设备")
@@ -111,106 +114,135 @@ final class CameraProbe: NSObject, ObservableObject {
 
     // MARK: - 主流程
 
+    /// 探针要做的事只有一件：回答「这台相机在 iPhone 上能不能出画面」。
+    ///
+    /// 所以它不逐条试命令，而是把整条取景链路一次走到底，
+    /// 每一步的返回码都记下来。哪一步断了，报告里直接看得出来。
     private func runProbe(on cam: ICCameraDevice) async {
         log(.ok, "发现相机：\(cam.name ?? "未命名")", detail: description(of: cam))
 
         main { self.phase = "打开会话" }
+        do {
+            try await cam.requestOpenSession()
+        } catch {
+            log(.warn, "打开会话报错，继续试命令", detail: error.localizedDescription
+                + "\n有时会话已经开了，只是系统报了个警告")
+        }
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
 
-        log(.info, "请求打开 PTP 会话")
-        // 这个方法是 async throws 的，不是老教程里的 completion 版
-        try? await cam.requestOpenSession()
+        // PTP 发包要阻塞等回调，得挪到专门的后台队列，
+        // 别占 Swift 并发的线程池，也别碰主线程。
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                self.probeLink(on: cam)
+                cont.resume()
+            }
+        }
+    }
 
-        // 不用 delegate 等回调，直接给一点时间。会话没开成的话，
-        // 后面第一条命令会回 SessionNotOpen —— 那也是我们要观察的结果之一。
-        try? await Task.sleep(nanoseconds: 1_500_000_000)
-        log(.info, "等待 1.5 秒后开始发命令")
+    private func probeLink(on cam: ICCameraDevice) {
+        let session = SonyPtpSession(camera: cam)
 
-        // ---- 1. 标准 PTP：能不能读设备信息
+        // ---- 1. 标准 PTP 通道
         main { self.phase = "标准 PTP" }
-        log(.info, "GetDeviceInfo (0x1001)")
-        if let r = await send(0x1001, [], "GetDeviceInfo") {
-            if r.isOK {
-                log(.ok, "标准 PTP 通道可用", detail: "返回参数 \(r.params.map { String(format: "0x%08X", $0) }.joined(separator: ", "))")
+        do {
+            // 认证前先撞一次，看这条通道本身通不通。
+            _ = try session.readProperties()
+        } catch {
+            log(.info, "认证前读属性不通，符合预期")
+        }
+
+        // ---- 2. 索尼认证
+        main { self.phase = "索尼认证" }
+        do {
+            let ver = try session.authenticate()
+            log(.ok, "认证通过", detail: "相机声明 PTP 协议版本 "
+                + String(format: "0x%04X", ver))
+        } catch {
+            log(.fail, "认证失败：\(error.localizedDescription)", detail: """
+            四步顺序是 0x9201[1,0,0] → 0x9201[2,0,0] → 0x9202[0xC8] → 0x9201[3,0,0]。
+            卡在 0x9201[1] 一般说明相机不在遥控模式；
+            卡在 0x9202 一般说明固件不认这个协议版本。
+            认证不过，后面一切都读不到，这里就停。
+            """)
+            finish("认证未通过")
+            return
+        }
+
+        // ---- 3. 读全部属性
+        main { self.phase = "读属性" }
+        var props: [SonySDIO.Property] = []
+        do {
+            props = try session.readProperties()
+            log(.ok, "读回 \(props.count) 条属性")
+        } catch {
+            log(.fail, "读属性失败：\(error.localizedDescription)")
+            finish("属性读不到")
+            return
+        }
+
+        let sdio = props.filter { $0.code >= 0xD000 }
+        log(.info, "其中索尼私有属性 \(sdio.count) 条",
+            detail: sdio.prefix(60).map { p in
+                p.label + (p.enabled ? "" : "(当前无效)") + (p.writable ? "可写" : "")
+            }.joined(separator: " "))
+
+        for (code, name) in [(PTP.propLiveViewStatus, "取景状态 D221"),
+                             (PTP.propObjectInMemory, "内存图像 D215"),
+                             (PTP.propFocusFound, "对焦状态 D213")] {
+            if let v = SonySDIO.scalar(props, code) {
+                log(.ok, "\(name) 可读，当前 \(v)")
             } else {
-                log(.warn, "GetDeviceInfo 返回 \(r.name)", detail: "通道可能在但会话没开好，继续往下测")
+                log(.warn, "\(name) 没出现", detail: "这条是取景/拍摄必需的状态位")
             }
         }
 
-        // ---- 2. Sony 握手（四步，逐步记录）
-        main { self.phase = "Sony 握手" }
-
-        await step(PTP.sonyConnect, [1], "SDIOConnect(1)")
-        await step(PTP.sonyConnect, [2], "SDIOConnect(2)")
-        await step(PTP.sonyExtDeviceInfo, [], "SDIOGetExtDeviceInfo")
-        await step(PTP.sonyConnect, [3], "SDIOConnect(3)")
-
-        // ---- 3. 读属性
-        main { self.phase = "读参数" }
-
-        if let r = await send(PTP.sonyAllPropData, [], "SDIOGetAllDevicePropData") {
-            if r.isOK {
-                log(.ok, "能读全部属性（0x9209）")
-            } else {
-                log(.warn, "读全部属性返回 \(r.name)")
-            }
-        }
-
-        // 单独读几个关键参数，看描述符能不能拿到
-        for (code, name) in [
-            (PTP.propISO, "ISO"),
-            (PTP.propShutterSpeed, "快门"),
-            (PTP.propFNumber, "光圈"),
-            (PTP.propExposureProgram, "曝光模式"),
-        ] {
-            if let r = await send(PTP.getDevicePropValue, [code], "GetDevicePropValue \(name)") {
-                if r.isOK {
-                    let v = r.params.first.map { String($0) } ?? "?"
-                    log(.ok, "\(name) 可读，当前值 \(v)")
-                } else {
-                    log(.warn, "\(name) 读不到：\(r.name)")
+        // ---- 4. 等取景就绪
+        main { self.phase = "等取景就绪" }
+        let t0 = Date()
+        do {
+            try session.waitForLiveView { round, status in
+                if round % 10 == 0 {
+                    let s = status.map { "\($0)" } ?? "读不到"
+                    self.log(.info, "第 \(round) 次轮询，D221 = \(s)")
                 }
             }
-        }
-
-        finish("完成")
-    }
-
-    private func step(_ code: UInt16, _ params: [UInt32], _ label: String) async {
-        guard let r = await send(code, params, label) else { return }
-        let p = params.map { String(format: "0x%X", $0) }.joined(separator: ",")
-        if r.isOK {
-            log(.ok, "\(label) → OK", detail: p.isEmpty ? nil : "参数 \(p)")
-        } else if r.code == 0x2005 || r.code == 0x2019 {
-            log(.warn, "\(label) → \(r.name)", detail: "这条不支持，说明命令码或参数和这台机器对不上")
-        } else {
-            log(.warn, "\(label) → \(r.name)", detail: p.isEmpty ? nil : "参数 \(p)")
-        }
-    }
-
-    // MARK: - 发一条 PTP
-
-    private func send(_ code: UInt16, _ params: [UInt32], _ label: String) async -> PTP.Response? {
-        guard let cam = camera else { return nil }
-        txn += 1
-        let cmd = PTP.makeCommand(code: code, transaction: txn, params: params)
-
-        // iOS 16+ 的 Swift 接口是 async 的，不是老教程里的 completion 版本。
-        // 网上大量示例还在用 sendInstruction:receiveYieldData:completion: 那套，
-        // 在 Swift 里编不过——只有 command 和 outData 两个参数。
-        let raw: Data
-        do {
-            let result = try await cam.requestSendPTPCommand(cmd, outData: nil)
-            raw = result.0
+            let dt = Date().timeIntervalSince(t0)
+            log(.ok, "取景就绪", detail: String(format: "等了 %.1f 秒", dt))
         } catch {
-            log(.fail, "\(label) 发送失败", detail: error.localizedDescription)
-            return nil
+            log(.fail, "取景没就绪", detail: error.localizedDescription)
+            finish("取景未就绪")
+            return
         }
-        guard let parsed = PTP.parseResponse(raw) else {
-            log(.warn, "\(label) 回了 \(raw.count) 字节，但不是标准响应容器",
-                detail: "前 16 字节：" + raw.prefix(16).map { String(format: "%02X", $0) }.joined(separator: " "))
-            return nil
+
+        // ---- 5. 抓一帧
+        main { self.phase = "抓取景帧" }
+        do {
+            guard let jpeg = try session.liveViewFrame() else {
+                log(.warn, "就绪了但这一帧是空的", detail: "再抓一次通常就有了，可以重跑探针")
+                finish("取到空帧")
+                return
+            }
+            let image = UIImage(data: jpeg)
+            let size = image.map { "\(Int($0.size.width))×\(Int($0.size.height))" } ?? "解不出来"
+            main { self.previewFrame = image }
+            log(.ok, "取到一帧取景", detail: "\(jpeg.count) 字节，\(size)")
+            if image == nil {
+                log(.warn, "JPEG 有内容但解不出图",
+                    detail: "前 8 字节：" + jpeg.prefix(8).map { String(format: "%02X", $0) }.joined(separator: " "))
+            }
+        } catch {
+            log(.fail, "抓帧失败：\(error.localizedDescription)")
+            finish("抓帧失败")
+            return
         }
-        return parsed
+
+        finish("链路全通")
+        log(.ok, "这条路走通了：实时取景能在 iPhone 上出画面", detail: """
+        下一步就是在这条通道上做两件事：
+        ① 连续抓帧，做成取景画面
+        ② 一边抓帧一边读 D2xx 属性，把参数显示出来
+        """)
     }
 
     // MARK: - 小工具

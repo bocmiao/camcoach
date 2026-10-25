@@ -26,6 +26,9 @@ struct ProbeView: View {
         List {
             preflightSection
             deviceSection
+            if let frame = probe.previewFrame {
+                previewSection(frame)
+            }
             selfCheckSection
             logSection
         }
@@ -125,6 +128,26 @@ struct ProbeView: View {
             } else {
                 Text("上面还有 \(data.connectChecks.count - confirmed.count) 项没确认。")
             }
+        }
+    }
+
+    // MARK: - 取景画面
+
+    /// 探针抓到的那一帧。有图就说明 PTP 画面通路真的通了，
+    /// 这比任何日志都直接。
+    private func previewSection(_ image: UIImage) -> some View {
+        Section {
+            Image(uiImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(maxWidth: .infinity)
+                .background(Color.black)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
+        } header: {
+            Text("取景画面")
+        } footer: {
+            Text("这一帧是相机通过 PTP 送过来的。能看到它，说明读取参数和连续取景都能做。")
         }
     }
 
