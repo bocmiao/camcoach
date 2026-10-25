@@ -153,21 +153,14 @@ struct BodyDiagram: View {
             crease(x: 242, from: 58, to: 238, s)
 
             // 卡口：金属环 → 内环 → 开口 → 三只卡口爪 → 镜膛
-            disc(168, 140, 58, s, fill: AnyShapeStyle(LinearGradient(
-                colors: [Color(white: 0.26), Color(white: 0.20)],
-                startPoint: .top, endPoint: .bottom)),
+            disc(168, 140, 58, s, hi: 0.26, lo: 0.20, radial: false,
                  strokeOpacity: 0.22, shadowOpacity: 0.26)
-            disc(168, 140, 50, s, fill: AnyShapeStyle(LinearGradient(
-                colors: [Color(white: 0.18), Color(white: 0.14)],
-                startPoint: .top, endPoint: .bottom)),
-                 strokeOpacity: 0.09, shadowOpacity: 0)
-            disc(168, 140, 44, s, fill: AnyShapeStyle(DiagramPalette.inset),
-                 strokeOpacity: 0.27, shadowOpacity: 0)
+            disc(168, 140, 50, s, hi: 0.18, lo: 0.14, radial: false,
+                 strokeOpacity: 0.09)
+            disc(168, 140, 44, s, hi: 0.07, lo: 0.07, radial: false,
+                 strokeOpacity: 0.27)
             bayonetTabs(s)
-            disc(168, 140, 26, s, fill: AnyShapeStyle(RadialGradient(
-                colors: [Color(white: 0.18), Color(white: 0.05)],
-                center: .center, startRadius: 0, endRadius: 26 * s)),
-                 strokeOpacity: 0.27, shadowOpacity: 0)
+            disc(168, 140, 26, s, hi: 0.18, lo: 0.05, strokeOpacity: 0.27)
 
             // 卡口环上的红色定位点
             Circle()
@@ -299,32 +292,43 @@ struct BodyDiagram: View {
                        _ radius: CGFloat, _ s: CGFloat,
                        hi: Double, lo: Double,
                        strokeOpacity: Double, shadowOpacity: Double) -> some View {
-        RoundedRectangle(cornerRadius: radius * s)
+        let lineW: CGFloat = max(0.5, 0.7 * s)
+        let shadowR: CGFloat = shadowOpacity > 0 ? 4 * s : 0
+        return RoundedRectangle(cornerRadius: radius * s)
             .fill(LinearGradient(colors: [Color(white: hi), Color(white: lo)],
                                  startPoint: .top, endPoint: .bottom))
             .frame(width: w * s, height: h * s)
             .overlay(
                 RoundedRectangle(cornerRadius: radius * s)
-                    .strokeBorder(Color.white.opacity(strokeOpacity),
-                                  lineWidth: max(0.5, 0.7 * s))
+                    .strokeBorder(Color.white.opacity(strokeOpacity), lineWidth: lineW)
             )
             .shadow(color: .black.opacity(shadowOpacity),
-                    radius: shadowOpacity > 0 ? 4 * s : 0, x: 0, y: 3 * s)
+                    radius: shadowR, x: 0, y: 3 * s)
             .offset(x: x * s, y: y * s)
     }
 
     private func disc(_ cx: CGFloat, _ cy: CGFloat, _ r: CGFloat, _ s: CGFloat,
-                      fill: AnyShapeStyle,
-                      strokeOpacity: Double, shadowOpacity: Double) -> some View {
-        Circle()
-            .fill(fill)
+                      hi: Double, lo: Double,
+                      radial: Bool = true,
+                      strokeOpacity: Double = 0.14,
+                      shadowOpacity: Double = 0) -> some View {
+        let style: AnyShapeStyle = radial
+            ? AnyShapeStyle(RadialGradient(colors: [Color(white: hi), Color(white: lo)],
+                                           center: .center,
+                                           startRadius: 0, endRadius: r * s))
+            : AnyShapeStyle(LinearGradient(colors: [Color(white: hi), Color(white: lo)],
+                                           startPoint: .top, endPoint: .bottom))
+        let lineW: CGFloat = max(0.5, 0.7 * s)
+        let shadowR: CGFloat = shadowOpacity > 0 ? 3 * s : 0
+        return Circle()
+            .fill(style)
             .overlay(
                 Circle().strokeBorder(Color.white.opacity(strokeOpacity),
-                                      lineWidth: max(0.5, 0.7 * s))
+                                      lineWidth: lineW)
             )
             .frame(width: r * 2 * s, height: r * 2 * s)
             .shadow(color: .black.opacity(shadowOpacity),
-                    radius: shadowOpacity > 0 ? 3 * s : 0, x: 0, y: 1.6 * s)
+                    radius: shadowR, x: 0, y: 1.6 * s)
             .offset(x: (cx - r) * s, y: (cy - r) * s)
     }
 
@@ -404,12 +408,13 @@ struct BodyDiagram: View {
         }
     }
 
-    /// 盖板之间的压痕。一比一像素，缩放后至少留 1pt，不然会消失。
+    /// 盖板之间的压痕。缩放后至少留 1pt，不然会消失。
     private func crease(x: CGFloat, from y0: CGFloat, to y1: CGFloat,
                         _ s: CGFloat) -> some View {
-        Rectangle()
+        let lineW: CGFloat = max(1, s)
+        return Rectangle()
             .fill(Color(white: 0.09))
-            .frame(width: max(1, 1 * s), height: (y1 - y0) * s)
+            .frame(width: lineW, height: (y1 - y0) * s)
             .offset(x: x * s, y: y0 * s)
     }
 
