@@ -9,6 +9,13 @@
 *.yaml  text eol=lf
 *.rb    text eol=lf
 
+# 批处理反过来，必须 CRLF。
+# cmd.exe 读 LF-only 的 .cmd 时 goto 定位会错位；这两份启动器里
+# 全是对标签的跳转，出错时表现为「命令闪一下就没了」。
+# 中文一律由 Python 打印，.cmd 里只允许 ASCII。
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+
 # 二进制，别碰
 *.p12   binary
 *.cer   binary
