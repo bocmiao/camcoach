@@ -10,7 +10,7 @@ import Foundation
 /// 改 JSON，否则下次重新生成会被覆盖。
 struct CameraData: Decodable {
     let schemaVersion: Int
-    let device: String
+    let device: DeviceInfo
     let views: [BodyViewInfo]
     let levels: [String: String]
     let ptpObservableLevels: [String: String]
@@ -28,6 +28,28 @@ struct CameraData: Decodable {
 
     func view(withID viewID: String) -> BodyViewInfo? {
         views.first { $0.id == viewID }
+    }
+}
+
+// MARK: - 机型
+
+/// 文案对应的机型与固件基线。
+///
+/// 菜单路径会随固件变。这组字段就是用来在界面上说清「以哪个版本为准」的，
+/// 不然用户拿着旧固件找不到某一项，会以为是 App 写错了。
+struct DeviceInfo: Decodable {
+    let model: String
+    let name: String
+    let firmwareBaseline: String?
+    let contentNote: String?
+    let disclaimer: String?
+
+    /// 一行标题，例如「ILCE-7M4 · 固件 Ver.6.02」。
+    var shortLabel: String {
+        if let fw = firmwareBaseline, !fw.isEmpty {
+            return "\(model) · 固件 \(fw)"
+        }
+        return model
     }
 }
 

@@ -46,6 +46,15 @@ jobs:
           # 与其等 archive 阶段报一句含混的错，不如现在就看清楚。
           xcodebuild -list -project CamCoach.xcodeproj
 
+      - name: 内容数据与 Swift 结构对得上
+        run: |
+          set -euo pipefail
+          # 编译能过不代表能解码。build 6 的 device 字段写成 String 而
+          # JSON 里是对象，xcbuild 全绿，装上直接白屏。
+          # 这步比对 JSON 结构和 CameraData.swift 的声明，顺便确认
+          # 仓库里那份是脚本生成的、没人手改过。
+          python3 tools/build-guide-data.py --check
+
       - name: 编译（不签名）
         run: |
           set -euo pipefail

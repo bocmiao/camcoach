@@ -12,6 +12,7 @@
 """
 import json
 import pathlib
+import sys
 
 HERE = pathlib.Path(__file__).resolve().parent          # ios/tools
 ROOT = HERE.parent                                       # ios
@@ -122,8 +123,119 @@ CONNECT_CHECKS = [
     {"title": "手机已经解锁", "detail": "iOS 的「有线配件」默认是解锁后才允许"},
 ]
 
+# ---------------------------------------------------------------- schema
+#
+# 与 CamCoach/Model/CameraData.swift 一一对应。
+#
+# 为什么要有这个：Swift 的 Codable 字段类型写错，编译期完全查不出来，
+# 要等 App 真的跑起来解码才炸，报的还是一句「数据格式不对」。
+# build 6 就是这么翻车的——`device` 在 JSON 里是对象，Swift 写成了 String。
+# 改 Swift 结构时这里也要跟着改，否则校验会放行一份解不出来的 JSON。
+#
+# 约定的写法：
+#   str / int          基本类型
+#   [x]                数组，元素是 x
+#   {k: x, ...}        对象，每个键都要在
+#   ("opt", x)         x 或 null
+#   ("dict", k, v)     键值都是字符串的字典
+#   ("number",)        int 或 float 都行
+#   ("hotspot",)       按 shape 分支校验坐标
+SCHEMA = {
+    "schemaVersion": int,
+    "device": {
+        "model": str,
+        "name": str,
+        "firmwareBaseline": ("opt", str),
+        "contentNote": ("opt", str),
+        "disclaimer": ("opt", str),
+    },
+    "views": [{"id": str, "name": str, "hint": str}],
+    "levels": ("dict", str, str),
+    "ptpObservableLevels": ("dict", str, str),
+    "buttons": [{
+        "id": str,
+        "name": str,
+        "aliases": [str],
+        "view": str,
+        "hotspot": ("hotspot",),
+        "level": str,
+        "location": str,
+        "default": str,
+        "whatItDoes": str,
+        "howToUse": str,
+        "whyItMatters": str,
+        "changeIt": str,
+        "misconception": str,
+        "ptpObservable": {
+            "level": str,
+            "property": ("opt", str),
+            "note": str,
+        },
+    }],
+    "menus": [{"want": str, "path": str, "note": str}],
+    "presets": [{"name": str, "desc": str, "params": str, "warn": str, "steps": [str]}],
+    "connectChecks": [{"title": str, "detail": str}],
+}
+
+
+def check_type(value, spec, path, errors):
+    """按 SCHEMA 递归校验。errors 收全部问题，不是遇到第一个就停。"""
+    if spec is str:
+        if not isinstance(value, str):
+            errors.append(f"{path}: 要字符串，实际 {type(value).__name__}")
+    elif spec is int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            errors.append(f"{path}: 要整数，实际 {type(value).__name__}")
+    elif isinstance(spec, tuple):
+        tag = spec[0]
+        if tag == "opt":
+            if value is not None:
+                check_type(value, spec[1], path, errors)
+        elif tag == "number":
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                errors.append(f"{path}: 要数字，实际 {type(value).__name__}")
+        elif tag == "dict":
+            if not isinstance(value, dict):
+                errors.append(f"{path}: 要对象，实际 {type(value).__name__}")
+                return
+            for k, v in value.items():
+                check_type(v, spec[2], f"{path}.{k}", errors)
+        elif tag == "hotspot":
+            if not isinstance(value, dict):
+                errors.append(f"{path}: 要对象，实际 {type(value).__name__}")
+                return
+            shape = value.get("shape")
+            keys = ("cx", "cy", "r") if shape == "circle" else ("x", "y", "w", "h")
+            if shape not in ("circle", "rect"):
+                errors.append(f"{path}.shape: 只能是 circle 或 rect，实际 {shape!r}")
+                return
+            for k in keys:
+                if k not in value:
+                    errors.append(f"{path}.{k}: 缺字段")
+                else:
+                    check_type(value[k], ("number",), f"{path}.{k}", errors)
+    elif isinstance(spec, list):
+        if not isinstance(value, list):
+            errors.append(f"{path}: 要数组，实际 {type(value).__name__}")
+            return
+        for i, item in enumerate(value):
+            check_type(item, spec[0], f"{path}[{i}]", errors)
+    elif isinstance(spec, dict):
+        if not isinstance(value, dict):
+            errors.append(f"{path}: 要对象，实际 {type(value).__name__}")
+            return
+        for k, sub in spec.items():
+            if k not in value:
+                errors.append(f"{path}.{k}: 缺字段")
+            else:
+                check_type(value[k], sub, f"{path}.{k}", errors)
+    else:
+        errors.append(f"{path}: SCHEMA 里写了个不认识的规则 {spec!r}")
+
 
 def main():
+    check_only = "--check" in sys.argv
+
     raw = json.loads(SRC.read_text(encoding="utf-8"))
     buttons = []
     added = 0
@@ -168,14 +280,41 @@ def main():
             if x < 0 or y < 0 or x + w > W or y + hh > H:
                 raise SystemExit(f"{b['id']} 热区出界: {h}")
 
-    OUT.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 写盘之前先过一遍 Swift 结构。这一步是 build 6 那次翻车之后加的：
+    # device 写成 String 而 JSON 是对象，编译全绿，装上直接白屏。
+    errors = []
+    check_type(out, SCHEMA, "$", errors)
+    if errors:
+        print("生成的 JSON 和 CameraData.swift 对不上：", file=sys.stderr)
+        for e in errors[:20]:
+            print("  " + e, file=sys.stderr)
+        if len(errors) > 20:
+            print(f"  ... 还有 {len(errors) - 20} 条", file=sys.stderr)
+        raise SystemExit(1)
+
+    expected = json.dumps(out, ensure_ascii=False, indent=2)
+
+    # --check：不写盘，只确认磁盘上那份是脚本生成的、而且和 Swift 结构对得上。
+    # CI 里跑这个，能挡住「手改了 JSON」和「改了 Swift 没同步数据」两种情况。
+    if check_only:
+        current = OUT.read_text(encoding="utf-8") if OUT.exists() else ""
+        if current != expected:
+            print("磁盘上的 camcoach-data.json 和脚本生成的不一致，"
+                  "重跑一次 tools/build-guide-data.py，别手改产物", file=sys.stderr)
+            return 1
+        print(f"内容数据校验通过：{len(buttons)} 个按钮、{len(VIEWS)} 个视角、"
+              f"{len(MENUS)} 条菜单、{len(PRESETS)} 个预设")
+        return 0
+
+    OUT.write_text(expected, encoding="utf-8")
 
     print(f"补了 {added} 个按钮的坐标")
     print(f"按钮 {len(buttons)} 个，视角 {len(VIEWS)} 个，菜单 {len(MENUS)} 条，预设 {len(PRESETS)} 个")
     print(f"写出 {OUT}  {OUT.stat().st_size} 字节")
     from collections import Counter
     print("各视角按钮数:", dict(Counter(b["view"] for b in buttons)))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

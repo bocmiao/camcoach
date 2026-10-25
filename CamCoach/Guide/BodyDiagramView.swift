@@ -20,6 +20,7 @@ struct BodyDiagramView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
+                deviceLabel
                 picker
                 diagramCard
                 if let b = selectedButton {
@@ -35,6 +36,18 @@ struct BodyDiagramView: View {
         .background(Color(.systemGroupedBackground))
         .navigationTitle("看按键")
         .navigationBarTitleDisplayMode(.large)
+    }
+
+    /// 机型与固件基线。菜单和键位会随固件变，先说明白这页是按哪版写的。
+    private var deviceLabel: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "camera")
+                .font(.caption2)
+            Text(data.device.shortLabel)
+                .font(.caption)
+            Spacer()
+        }
+        .foregroundStyle(.secondary)
     }
 
     // MARK: - 视角

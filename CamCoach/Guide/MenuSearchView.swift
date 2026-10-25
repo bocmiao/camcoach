@@ -23,6 +23,13 @@ struct MenuSearchView: View {
                     row(m)
                 }
             }
+
+            if let fw = data.device.firmwareBaseline, !fw.isEmpty {
+                Section {
+                } footer: {
+                    Text("菜单路径以固件 \(fw) 为准，低版本可能不同。")
+                }
+            }
         }
         .listStyle(.insetGrouped)
         .searchable(text: $query, prompt: "试试「卡」「声」「网格」")
