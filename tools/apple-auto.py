@@ -18,8 +18,8 @@
   python apple-auto.py --p8 AuthKey_ABC12345.p8 --key-id ABC12345 --issuer-id 69a6de7c-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 
 可选参数：
-  --bundle-id   默认 com.camcoach.app
-  --profile     默认 CamCoach AppStore
+  --bundle-id   不给就从 ship.config.json / project.yml 推断
+  --profile     描述文件名（不给就用 <app-name> AppStore）
   --out         默认 ./cert
   --check       只验证 API Key 是否有效，不创建任何东西
   --force       强制重新签证书（默认会复用 cert/ 里已有的）
@@ -31,6 +31,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import secrets
 import string
 import sys
@@ -38,6 +39,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+# 项目名。只影响显示文案和证书/p12 的友好名——Apple 签发时不看这些，
+# 真正决定归属的是 Team ID。main() 一开始会按 --app-name 或工程文件重新赋值。
+APP_NAME = "iOS App"
 
 # Windows 控制台默认 GBK，中文会炸。强制 UTF-8。
 try:
@@ -188,7 +193,13 @@ def api_err(payload):
 
 # ---------------------------------------------------------------- 证书
 
-def gen_key_and_csr():
+def gen_key_and_csr(app_name="iOS App"):
+    """生成 RSA 私钥和 CSR。
+
+    app_name 只影响 CSR 里的 Common Name，而 Apple 签发时不看这个字段
+    （真正决定归属的是你的账号和 Team ID），所以填什么都不影响能不能签。
+    留着是为了在后台的证书列表里认得出是哪个项目的。
+    """
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
@@ -200,8 +211,8 @@ def gen_key_and_csr():
         .subject_name(
             x509.Name(
                 [
-                    x509.NameAttribute(NameOID.COMMON_NAME, "CamCoach Distribution"),
-                    x509.NameAttribute(NameOID.ORGANIZATION_NAME, "CamCoach"),
+                    x509.NameAttribute(NameOID.COMMON_NAME, f"{app_name} Distribution"),
+                    x509.NameAttribute(NameOID.ORGANIZATION_NAME, app_name),
                     x509.NameAttribute(NameOID.COUNTRY_NAME, "CN"),
                 ]
             )
@@ -217,7 +228,7 @@ def gen_key_and_csr():
     return key, key_pem, csr_pem
 
 
-def build_p12(key, cer_der, password, warn=True):
+def build_p12(key, cer_der, password, warn=True, friendly_name=None):
     """合成 .p12。
 
     格式有讲究，别再改回去：
@@ -242,7 +253,7 @@ def build_p12(key, cer_der, password, warn=True):
     )
     cert_pem = cert.public_bytes(serialization.Encoding.PEM)
 
-    tmpdir = tempfile.mkdtemp(prefix="camcoach-p12-")
+    tmpdir = tempfile.mkdtemp(prefix="ship-p12-")
     try:
         kp = os.path.join(tmpdir, "k.pem")
         cp = os.path.join(tmpdir, "c.pem")
@@ -258,7 +269,7 @@ def build_p12(key, cer_der, password, warn=True):
             "-passout", "pass:" + password,
             "-certpbe", "PBE-SHA1-3DES",
             "-keypbe", "PBE-SHA1-3DES",
-            "-name", "CamCoach Distribution",
+            "-name", friendly_name or (APP_NAME + " Distribution"),
         ]
 
         # 先试完整版（OpenSSL 1.1.1+ 才有 -macalg）
@@ -282,7 +293,7 @@ def build_p12(key, cer_der, password, warn=True):
     from cryptography.hazmat.primitives.serialization import BestAvailableEncryption, pkcs12
 
     return pkcs12.serialize_key_and_certificates(
-        name=b"CamCoach Distribution",
+        name=(friendly_name or (APP_NAME + " Distribution")).encode(),
         key=key,
         cert=cert,
         cas=None,
@@ -293,6 +304,108 @@ def build_p12(key, cer_der, password, warn=True):
 def rand_password(n=24):
     alphabet = string.ascii_letters + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(n))
+
+
+def infer_app_name():
+    """猜个项目名，纯为了显示和命名好看。
+
+    顺序：ship.config.json 的 appName → project.yml 的 CFBundleDisplayName
+    → project.yml 的第一个 target 名 → 兜底。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    parent = os.path.dirname(here)
+
+    for d in (here, parent):
+        cfg = os.path.join(d, "ship.config.json")
+        if os.path.exists(cfg):
+            try:
+                with open(cfg, encoding="utf-8") as f:
+                    data = json.load(f)
+                if data.get("appName"):
+                    return data["appName"]
+                if data.get("scheme"):
+                    return data["scheme"]
+            except Exception:
+                pass
+
+    proj = os.path.join(parent, "project.yml")
+    if os.path.exists(proj):
+        try:
+            txt = open(proj, encoding="utf-8", errors="replace").read()
+            m = re.search(r"CFBundleDisplayName:\s*(.+)", txt)
+            if m:
+                return m.group(1).strip().strip('"').strip("'")
+            m = re.search(r"^targets:\s*$\s*^  (\w+):", txt, re.M)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+
+    return "iOS App"
+
+
+def infer_bundle_id():
+    """猜 Bundle ID。
+
+    顺序：ship.config.json 的 bundleId → project.yml 的
+    PRODUCT_BUNDLE_IDENTIFIER → 空字符串（交给调用方去问）。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    parent = os.path.dirname(here)
+
+    for d in (here, parent):
+        cfg = os.path.join(d, "ship.config.json")
+        if os.path.exists(cfg):
+            try:
+                with open(cfg, encoding="utf-8") as f:
+                    val = (json.load(f) or {}).get("bundleId")
+                if val:
+                    return val
+            except Exception:
+                pass
+
+    proj = os.path.join(parent, "project.yml")
+    if os.path.exists(proj):
+        try:
+            txt = open(proj, encoding="utf-8", errors="replace").read()
+            m = re.search(r"PRODUCT_BUNDLE_IDENTIFIER:\s*([\w.\-]+)", txt)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+
+    return ""
+
+
+def detect_repo():
+    """猜当前仓库的 owner/name，纯为了打印一个能点的链接。
+
+    先试 gh（最准，能处理 remote 不叫 origin 的情况），
+    再退回解析 git remote 的 URL。都不行返回空字符串。
+    """
+    import subprocess
+
+    try:
+        p = subprocess.run(["gh", "repo", "view", "--json", "nameWithOwner",
+                            "-q", ".nameWithOwner"],
+                           capture_output=True, text=True, timeout=15)
+        if p.returncode == 0 and p.stdout.strip():
+            return p.stdout.strip()
+    except Exception:
+        pass
+
+    try:
+        p = subprocess.run(["git", "remote", "get-url", "origin"],
+                           capture_output=True, text=True, timeout=15)
+        if p.returncode == 0:
+            url = p.stdout.strip()
+            m = re.search(r"github\.com[:/]+(.+?)(?:\.git)?$", url)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+
+    return ""
 
 
 def find_p8():
@@ -352,8 +465,9 @@ def main():
     ap.add_argument("--p8", default="", help="AuthKey_XXXX.p8 的路径（不填就自动找）")
     ap.add_argument("--key-id", default="", help="Key ID（不填就从文件名推）")
     ap.add_argument("--issuer-id", default="", help="Issuer ID（UUID 形式）")
-    ap.add_argument("--bundle-id", default="com.camcoach.app")
-    ap.add_argument("--profile", default="CamCoach AppStore")
+    ap.add_argument("--app-name", default="", help="项目显示名，不填就从工程文件推断")
+    ap.add_argument("--bundle-id", default="", help="不给就从 ship.config.json / project.yml 推断")
+    ap.add_argument("--profile", default="")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "cert"))
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--force", action="store_true")
@@ -365,10 +479,29 @@ def main():
     )
     args = ap.parse_args()
 
+    global APP_NAME
+    APP_NAME = args.app_name or infer_app_name()
+    if not args.profile:
+        args.profile = APP_NAME + " AppStore"
+
+    # bundle id 不给就推断；推断不出来在这里就问，别等到第 5 步才炸
+    if not args.bundle_id:
+        args.bundle_id = infer_bundle_id()
+        if args.bundle_id:
+            print("  Bundle ID 推断为: " + args.bundle_id)
+    if not args.bundle_id and not args.check:
+        print()
+        print("  不知道该建哪个 Bundle ID（工程目录里没有 ship.config.json / project.yml）。")
+        print("  格式是反域名，比如 com.yourname.myapp —— 全球唯一，被占了就换一个。")
+        args.bundle_id = ask("Bundle ID")
+    if args.bundle_id and not re.match(r"^[A-Za-z0-9][A-Za-z0-9.\-]+$", args.bundle_id):
+        die("Bundle ID 格式不对: " + args.bundle_id,
+            "只能有字母、数字、点、短横线，且以字母或数字开头。")
+
     require_crypto()
 
     print()
-    print("  CamCoach 证书自动化")
+    print("  " + APP_NAME + " 证书自动化")
     print("  " + "-" * 52)
 
     # ---- 0. 补全三个必填项
@@ -601,7 +734,7 @@ def main():
             if cert_id:
                 info("复用上次的证书 ID: " + cert_id)
     else:
-        key, key_pem, csr_pem = gen_key_and_csr()
+        key, key_pem, csr_pem = gen_key_and_csr(APP_NAME)
         with open(key_path, "wb") as f:
             f.write(key_pem)
         with open(csr_path, "wb") as f:
@@ -682,7 +815,7 @@ def main():
                 "type": "bundleIds",
                 "attributes": {
                     "identifier": args.bundle_id,
-                    "name": "CamCoach",
+                    "name": APP_NAME,
                     "platform": "UNIVERSAL",
                 },
             }
@@ -762,7 +895,7 @@ def main():
     content = (prof.get("attributes") or {}).get("profileContent")
     if not content:
         die("Apple 返回里没有描述文件内容。", json.dumps(payload)[:600])
-    prof_path = os.path.join(out, "CamCoach.mobileprovision")
+    prof_path = os.path.join(out, "distribution.mobileprovision")
     with open(prof_path, "wb") as f:
         f.write(base64.b64decode(content))
     ok("描述文件已保存 " + os.path.basename(prof_path))
@@ -787,7 +920,7 @@ def main():
     long_vals = [
         ("ASC_KEY_CONTENT", b64_of(os.path.abspath(args.p8)), "AuthKey .p8 的 base64"),
         ("IOS_CERT_P12_BASE64", b64_of(p12_path), "distribution.p12 的 base64"),
-        ("IOS_PROFILE_BASE64", b64_of(prof_path), "CamCoach.mobileprovision 的 base64"),
+        ("IOS_PROFILE_BASE64", b64_of(prof_path), "distribution.mobileprovision 的 base64"),
     ]
 
     sec_path = os.path.join(out, "secrets.txt")
@@ -809,7 +942,7 @@ def main():
     print("    distribution.key          私钥（别外传）")
     print("    distribution.cer          Apple 签发的证书")
     print("    distribution.p12          CI 导入用的打包证书")
-    print("    CamCoach.mobileprovision  描述文件")
+    print("    distribution.mobileprovision  描述文件")
     print("    secrets.txt               8 个 Secret 的成品，可直接粘贴")
     print()
     print("  短值（可以直接抄）：")
@@ -825,7 +958,11 @@ def main():
     print("  这 8 条已经全部写进下面的文件，打开复制粘贴即可：")
     print("    " + sec_path)
     print()
-    print("  仓库地址：https://github.com/bocmiao/camcoach/settings/secrets/actions")
+    repo = detect_repo()
+    if repo:
+        print("  仓库地址：https://github.com/" + repo + "/settings/secrets/actions")
+    else:
+        print("  仓库地址：https://github.com/<你的账号>/<你的仓库>/settings/secrets/actions")
     print()
 
 

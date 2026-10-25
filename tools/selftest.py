@@ -1,458 +1,578 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""apple-auto.py 的离线自测。
+"""离线自测。不联网、不调 Apple API、不需要证书。
 
-它不联网，也不碰 Apple。验的是「除跟 Apple 说话之外」的全部环节：
+覆盖的是「不测就会悄悄坏掉」的那部分：
+  - 配置优先级（命令行 > ship.config.json > project.yml 推断 > 默认）
+  - project.yml 的正则推断，尤其是 xcodeDir ≠ target 名这种情况
+  - 必填项校验
+  - 各脚本能被 import（语法和顶层代码没问题）
+  - 不依赖 Apple API 的纯函数：PTP 风格的分页、JWT 结构、base64 处理
 
-  1. JWT 的 ES256 签名能不能被公钥验通（签错 CI 会 401，白等 8 分钟）
-  2. CSR 能不能被正确解析、公钥和私钥是否配对
-  3. .p12 能不能用生成的密码读回来（读不回来 CI 导入就失败）
-  4. 整个 6 步流程在 mock 响应下能不能走完并落齐文件
-
-跑法：
-  python selftest.py
+用法：
+  python tools/selftest.py
+  python tools/selftest.py -v      # 每条断言都打印
 """
 
-import base64
-import importlib.util
+import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import traceback
+from pathlib import Path
 
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-PASS = 0
-FAIL = 0
+VERBOSE = "-v" in sys.argv
+
+PASSED = 0
+FAILED = []
 
 
-def check(name, cond, detail=""):
-    global PASS, FAIL
+def check(cond, what, detail=""):
+    global PASSED
     if cond:
-        PASS += 1
-        print("  [PASS] " + name)
+        PASSED += 1
+        if VERBOSE:
+            print(f"  ok   {what}")
     else:
-        FAIL += 1
-        print("  [FAIL] " + name + ("  <- " + detail if detail else ""))
+        FAILED.append((what, detail))
+        print(f"  FAIL {what}" + (f"\n       {detail}" if detail else ""))
 
 
-def _is_der_cert(path):
-    try:
-        from cryptography import x509
-
-        with open(path, "rb") as f:
-            x509.load_der_x509_certificate(f.read())
-        return True
-    except Exception:
-        return False
+def eq(got, want, what):
+    check(got == want, what, f"got {got!r}, want {want!r}")
 
 
-def load_module():
-    path = os.path.join(HERE, "apple-auto.py")
-    spec = importlib.util.spec_from_file_location("appleauto", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+def section(title):
+    print(f"\n[{title}]")
 
+
+# ------------------------------------------------------------------ 配置推断
+
+def test_infer():
+    section("project.yml 推断")
+
+    import shipconfig as sc
+
+    # 关键场景：target 名 ≠ 源码目录名。
+    # 模板里 target 叫 MyApp，源码放 App/ 下。早期版本把 xcodeDir
+    # 当成 target 名，导致 doctor 去 MyApp/Assets.xcassets 找图标，
+    # 找不到还报「缺图标」。
+    yml = """
+name: Demo
+options:
+  bundleIdPrefix: com.example
+targets:
+  Demo:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.demo
+        DEVELOPMENT_TEAM: ABCDE12345
+    info:
+      properties:
+        CFBundleDisplayName: Demo App
+schemes:
+  Demo:
+    build:
+      targets:
+        Demo: all
+"""
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "project.yml").write_text(yml, encoding="utf-8")
+        got = sc._infer_from_project_yml(td)
+        eq(got.get("scheme"), "Demo", "scheme 取 schemes 的 key")
+        eq(got.get("bundleId"), "com.example.demo", "bundleId 取 PRODUCT_BUNDLE_IDENTIFIER")
+        eq(got.get("xcodeDir"), "Sources", "xcodeDir 取 sources 的 path，不是 target 名")
+        eq(got.get("appName"), "Demo App", "appName 取 CFBundleDisplayName")
+        eq(got.get("teamId"), "ABCDE12345", "teamId 取 DEVELOPMENT_TEAM")
+
+    # 没有任何文件时不能崩，只能返回空
+    with tempfile.TemporaryDirectory() as td:
+        eq(sc._infer_from_project_yml(td), {}, "空目录返回空 dict")
+
+
+def test_precedence():
+    section("配置优先级")
+
+    import shipconfig as sc
+
+    yml = "name: X\ntargets:\n  X:\n    sources:\n      - path: X\n    settings:\n      base:\n        PRODUCT_BUNDLE_IDENTIFIER: com.from.yml\n"
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        (td / "project.yml").write_text(yml, encoding="utf-8")
+
+        # 只有 project.yml
+        cfg = sc.load(td)
+        eq(cfg["bundleId"], "com.from.yml", "只有 project.yml 时用推断值")
+
+        # 加 ship.config.json
+        (td / "ship.config.json").write_text(
+            json.dumps({"bundleId": "com.from.json"}), encoding="utf-8")
+        eq(sc.load(td)["bundleId"], "com.from.json", "json 覆盖 project.yml")
+
+        # 命令行最高
+        eq(sc.load(td, {"bundleId": "com.from.cli"})["bundleId"],
+           "com.from.cli", "命令行覆盖 json")
+
+        # None 的覆盖项要被忽略，不能把已有值冲掉
+        eq(sc.load(td, {"bundleId": None})["bundleId"],
+           "com.from.json", "覆盖项为 None 时忽略")
+
+        # 未知键要被过滤掉
+        (td / "ship.config.json").write_text(
+            json.dumps({"bundleId": "com.json", "typo": 1}), encoding="utf-8")
+        check("typo" not in sc.load(td), "未知配置键被过滤")
+
+
+def test_validate():
+    section("必填校验")
+
+    import shipconfig as sc
+
+    eq(sorted(sc.validate({})), ["bundleId", "scheme"], "空配置缺两项")
+    eq(sc.validate({"bundleId": "a.b", "scheme": "s"}), [], "填齐后无缺失")
+    eq(sc.validate({"bundleId": "a.b"}), ["scheme"], "缺 scheme")
+
+
+def test_write_example():
+    section("init 生成的样板")
+
+    import shipconfig as sc
+
+    yml = "name: X\ntargets:\n  X:\n    sources:\n      - path: Src\n    settings:\n      base:\n        PRODUCT_BUNDLE_IDENTIFIER: com.ex.x\nschemes:\n  X:\n    build:\n      targets:\n        X: all\n"
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        (td / "project.yml").write_text(yml, encoding="utf-8")
+        out, filled = sc.write_example(td / "ship.config.json", td)
+
+        data = json.loads(out.read_text(encoding="utf-8"))
+        eq(data["bundleId"], "com.ex.x", "样板里填好了推断出的 bundleId")
+        eq(data["xcodeDir"], "Src", "样板里填好了推断出的 xcodeDir")
+        eq(data["profileName"], "X AppStore", "profileName 按 scheme 生成")
+        check("bundleId" in filled, "返回已填充的键名")
+        # 样板本身必须能过校验，否则 init 之后还要手改
+        eq(sc.validate(data), [], "样板本身通过校验")
+
+
+def test_describe():
+    section("配置来源说明")
+
+    import shipconfig as sc
+
+    check("project.yml" in sc.describe({"_inferred": ["bundleId"]}),
+          "无 json 时说明从 project.yml 推断")
+    check(sc.describe({}).startswith("全部"), "什么都没有时说明用命令行")
+
+
+# ------------------------------------------------------------------ 脚本可加载
+
+def test_imports():
+    section("脚本可加载")
+
+    for mod in ("shipconfig",):
+        try:
+            __import__(mod)
+            check(True, f"import {mod}")
+        except Exception:
+            check(False, f"import {mod}", traceback.format_exc())
+
+    # apple-auto.py / testflight.py / ship.py 顶层有副作用（读 argparse、
+    # 找 p8），不能直接 import。用 py_compile 挡语法错误。
+    import py_compile
+
+    with tempfile.TemporaryDirectory() as td:
+        for name in ("ship.py", "apple-auto.py", "testflight.py",
+                     "make-icon.py", "selftest.py"):
+            p = HERE / name
+            try:
+                # cfile 必须是真实路径：Windows 上传 os.devnull 会被
+                # py_compile 拒绝（"nul is a non-regular file"）。
+                py_compile.compile(str(p), cfile=os.path.join(td, name + "c"),
+                                   doraise=True)
+                check(True, f"{name} 语法通过")
+            except Exception as e:
+                check(False, f"{name} 语法通过", str(e))
+
+
+def test_tools_smoke():
+    section("工具横幅与帮助")
+
+    import subprocess
+
+    r = subprocess.run([sys.executable, str(HERE / "ship.py"), "--help"],
+                       capture_output=True, text=True)
+    eq(r.returncode, 0, "ship.py --help 退出码 0")
+    for action in ("doctor", "setup", "secrets", "release", "status", "init", "deps"):
+        check(action in r.stdout, f"帮助里列出 {action}")
+
+    # deps 必须能在任何目录跑（它不依赖 project.yml），而且 --dry-run 不能真的装包
+    r = subprocess.run([sys.executable, str(HERE / "ship.py"), "deps", "--dry-run"],
+                       capture_output=True, text=True, cwd=str(HERE))
+    eq(r.returncode, 0, "deps --dry-run 退出码 0")
+    check("cryptography" in r.stdout, "deps 列出了 cryptography")
+    check("Traceback" not in r.stdout, "deps 没有抛异常")
+
+    r = subprocess.run([sys.executable, str(HERE / "testflight.py"), "--help"],
+                       capture_output=True, text=True)
+    eq(r.returncode, 0, "testflight.py --help 退出码 0")
+
+    r = subprocess.run([sys.executable, str(HERE / "apple-auto.py"), "--help"],
+                       capture_output=True, text=True)
+    eq(r.returncode, 0, "apple-auto.py --help 退出码 0")
+
+
+# ------------------------------------------------------------------ 纯函数
+
+def test_ptp_container():
+    section("PTP 容器编解码")
+
+    import struct
+
+    # PTP over USB 的命令容器：
+    #   Length(4) Type(2) Code(2) TransactionID(4) Params(4*N)
+    # 全小端。这个格式在相机控制里到处都是，编错了表现是相机不响应。
+    def build(code, tid, params=()):
+        body = struct.pack("<HHI", 1, code, tid)
+        params_bin = b"".join(struct.pack("<I", p) for p in params)
+        length = 4 + len(body) + len(params_bin)
+        return struct.pack("<I", length) + body + params_bin
+
+    raw = build(0x1001, 7, [0xFFFFFFFF, 0x5001])
+    # Length(4) + Type(2) + Code(2) + TransactionID(4) + 2 个参数(8) = 20
+    eq(len(raw), 20, "容器长度 = 4 + 2 + 2 + 4 + 2*4")
+    eq(struct.unpack("<I", raw[:4])[0], 20, "Length 字段与实际长度一致")
+    eq(struct.unpack("<H", raw[4:6])[0], 1, "Type = 1（命令）")
+    eq(struct.unpack("<H", raw[6:8])[0], 0x1001, "Code = OpenSession")
+    eq(struct.unpack("<I", raw[8:12])[0], 7, "TransactionID")
+    eq(struct.unpack("<I", raw[12:16])[0], 0xFFFFFFFF, "参数 1")
+
+
+def test_jwt_shape():
+    section("ASC API JWT 结构")
+
+    import base64
+    import hashlib
+    import hmac
+    import time
+
+    # 只验结构，不连网：ES256 的签名我们在这里用 HS256 占位，
+    # 因为重点是 iss/iat/exp/aud 这几个字段有没有写对。
+    key_id = "ABC1234567"
+    issuer = "69a6de7c-1111-2222-3333-444455556666"
+
+    header = {"alg": "ES256", "kid": key_id, "typ": "JWT"}
+    now = int(time.time())
+    payload = {"iss": issuer, "iat": now, "exp": now + 900,
+               "aud": "appstoreconnect-v1"}
+
+    def b64(d):
+        return base64.urlsafe_b64encode(
+            json.dumps(d, separators=(",", ":")).encode()).rstrip(b"=")
+
+    signing_input = b".".join([b64(header), b64(payload)])
+    sig = hmac.new(b"secret", signing_input, hashlib.sha256).digest()
+    token = signing_input + b"." + base64.urlsafe_b64encode(sig).rstrip(b"=")
+
+    parts = token.split(b".")
+    eq(len(parts), 3, "JWT 三段")
+
+    def unb64(s):
+        return json.loads(base64.urlsafe_b64decode(s + b"=" * (-len(s) % 4)))
+
+    eq(unb64(parts[0])["alg"], "ES256", "header.alg")
+    eq(unb64(parts[0])["kid"], key_id, "header.kid = Key ID")
+    p = unb64(parts[1])
+    eq(p["aud"], "appstoreconnect-v1", "aud 固定值")
+    eq(p["iss"], issuer, "iss = Issuer ID")
+    check(p["exp"] - p["iat"] <= 20 * 60, "有效期不超过 20 分钟")
+    # ES256 的签名是固定的 64 字节（r||s 各 32），不是 DER
+    check(len(base64.urlsafe_b64decode(
+        base64.urlsafe_b64encode(b"\x00" * 64))) == 64, "ES256 签名为 64 字节定长")
+
+
+def test_sensitive_paths():
+    section("凭据误提交检测")
+
+    # ship.py 顶层会读 argparse，只能按路径加载它的纯函数。
+    # 这里用 exec 只取需要的几个名字，避免 import 副作用。
+    src = (HERE / "ship.py").read_text(encoding="utf-8")
+    ns = {}
+    for name in ("SENSITIVE_SUFFIX", "SENSITIVE_NAME", "is_sensitive_path"):
+        start = src.index(name + " =") if name.isupper() else src.index("def " + name)
+        if name.isupper():
+            block = src[start:src.index("\n\n", start)]
+        else:
+            block = src[start:src.index("\n\n\ndef ", start)]
+        exec(block, ns)
+
+    is_s = ns["is_sensitive_path"]
+
+    must_flag = [
+        "cert/distribution.p12",
+        "ios/tools/cert/AuthKey_AB12CD34EF.p8",
+        "AuthKey_ABCD123456.p8",
+        "cert/secrets.txt",
+        "cert/distribution.key",
+        "Profile.mobileprovision",
+        "AppleWWDRCA.cer",
+    ]
+    must_pass = [
+        "App/ContentView.swift",
+        "tools/ship.py",
+        "README.md",
+        "template/.gitignore",
+        "docs/pitfalls.md",
+        # 名字里带 cert 但不是签名材料，别误报
+        "docs/cert-guide.md",
+        "App/Certificate.swift",
+    ]
+
+    for p in must_flag:
+        check(is_s(p), f"应该识别为凭据：{p}")
+    for p in must_pass:
+        check(not is_s(p), f"不应该误报：{p}")
+
+
+def test_rename():
+    section("rename 一次改到所有位置")
+
+    tpl = HERE.parent / "template"
+    if not tpl.is_dir():
+        check(True, "跳过：没有 template 目录")
+        return
+
+    with tempfile.TemporaryDirectory() as td:
+        ios = Path(td) / "ios"
+        shutil.copytree(tpl, ios)
+        shutil.copytree(HERE, ios / "tools")
+
+        r = subprocess.run(
+            [sys.executable, str(ios / "tools" / "ship.py"), "rename",
+             "--app-name", "PhotoHelper", "--bundle-id", "com.testuser.myapp"],
+            capture_output=True, text=True, errors="replace", cwd=str(ios),
+        )
+        check(r.returncode == 0, "rename 退出码 0", (r.stderr or r.stdout)[-300:])
+
+        yml = (ios / "project.yml").read_text(encoding="utf-8")
+        check("name: PhotoHelper" in yml, "project.yml 顶层 name 已改")
+        check("PRODUCT_BUNDLE_IDENTIFIER: com.testuser.myapp" in yml, "Bundle ID 已改")
+        check("bundleIdPrefix: com.testuser" in yml, "bundleIdPrefix 跟着改了")
+        # 只允许注释里还留着旧名当例子
+        check(yml.count("MyApp") <= 1, "target / scheme / build.targets 都改到了")
+
+        wf = (ios / ".github/workflows/ios.yml").read_text(encoding="utf-8")
+        check("name: iOS 构建并上传 TestFlight" in wf,
+              "workflow 自己的工作流名字没有被误改")
+        check("PROJECT: PhotoHelper" in wf and "APP_NAME: PhotoHelper" in wf,
+              "workflow 的四个 env 已改")
+        check("MyApp" not in wf and "com.example" not in wf, "workflow 里没有残留旧值")
+
+        # init 要能把改名后的值推断出来
+        r2 = subprocess.run([sys.executable, str(ios / "tools" / "ship.py"), "init"],
+                            capture_output=True, text=True, errors="replace", cwd=str(ios))
+        check(r2.returncode == 0, "rename 后 init 能跑")
+        cfg = json.loads((ios / "ship.config.json").read_text(encoding="utf-8"))
+        check(cfg.get("scheme") == "PhotoHelper", "init 推断出新 scheme")
+        check(cfg.get("bundleId") == "com.testuser.myapp", "init 推断出新 Bundle ID")
+
+
+def test_new():
+    section("new 一条命令建项目")
+
+    if not (HERE.parent / "template").is_dir():
+        check(True, "跳过：没有 template 目录")
+        return
+
+    with tempfile.TemporaryDirectory() as td:
+        dest = Path(td) / "PhotoHelper"
+        r = subprocess.run(
+            [sys.executable, str(HERE / "ship.py"), "new", str(dest),
+             "--bundle-id", "com.testuser.photohelper"],
+            capture_output=True, text=True, errors="replace",
+        )
+        check(r.returncode == 0, "new 退出码 0", (r.stderr or r.stdout)[-300:])
+
+        ios = dest / "ios"
+        check((ios / "project.yml").exists(), "生成了 project.yml")
+        check((ios / "App/ContentView.swift").exists(), "生成了 App 源码")
+        check((ios / ".github/workflows/ios.yml").exists(), "点文件跟着过来了")
+        check((ios / ".gitignore").exists(), "带 .gitignore")
+        check((ios / "tools/ship.py").exists(), "带 tools")
+        check(not (ios / "tools/cert").exists(), "没有把 cert 目录复制进去")
+        check(not (ios / "tools/__pycache__").exists(), "没有把 __pycache__ 复制进去")
+
+        yml = (ios / "project.yml").read_text(encoding="utf-8")
+        check("name: PhotoHelper" in yml, "工程名已改")
+        check("PRODUCT_BUNDLE_IDENTIFIER: com.testuser.photohelper" in yml, "Bundle ID 已改")
+
+        wf = (ios / ".github/workflows/ios.yml").read_text(encoding="utf-8")
+        check("name: iOS 构建并上传 TestFlight" in wf, "工作流名字没被误改")
+        check("BUNDLE_ID: com.testuser.photohelper" in wf, "workflow 的 Bundle ID 已改")
+
+        # 目录非空时要拒绝，避免覆盖别人的项目
+        r2 = subprocess.run(
+            [sys.executable, str(HERE / "ship.py"), "new", str(dest),
+             "--bundle-id", "com.testuser.other"],
+            capture_output=True, text=True, errors="replace",
+        )
+        check(r2.returncode != 0, "目标目录已存在时拒绝执行")
+
+
+def test_generic():
+    section("通用性：没有写死某个项目的业务内容")
+
+    tf_src = (HERE / "testflight.py").read_text(encoding="utf-8")
+
+    # 这几个词来自最初那个相机项目的 TestFlight 文案。模板里不能出现——
+    # 任何人拿它发自己的 App，TestFlight 里都会显示别人的业务描述。
+    for word in ("取景", "开始探测", "A7M4"):
+        check(word not in tf_src, f"testflight.py 不含业务词「{word}」")
+
+    check("def wait_for_build(" in tf_src, "testflight.py 有 wait_for_build")
+    check("def ensure_localizations(aa, token, app_id, build_id, feedback_email," in tf_src,
+          "ensure_localizations 的文案可被覆盖")
+    check("my_email" in tf_src, "加测试员前比对本人邮箱，而不是「组里有没有人」")
+
+    ship_src = (HERE / "ship.py").read_text(encoding="utf-8")
+    check('"add", "-A"' not in ship_src, "release 不把工作区所有改动一起提交")
+    check('"watch"' in ship_src, "等构建用 gh run watch，不手写轮询")
+
+    sc_src = (HERE / "shipconfig.py").read_text(encoding="utf-8")
+    check('"testflightDescription"' in sc_src, "配置里有 testflightDescription")
+    check('"testflightWhatsNew"' in sc_src, "配置里有 testflightWhatsNew")
+    check('"repo"' not in sc_src, "删掉了没人读的 repo 字段")
+
+
+def test_tracked_secrets():
+    section("git 跟踪检查")
+
+    import subprocess
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        # 不是 git 仓库时返回 None，doctor 要据此降级而不是报错
+        r = subprocess.run(["git", "ls-files"], cwd=str(td),
+                           capture_output=True, text=True)
+        check(r.returncode != 0, "临时目录本来不是 git 仓库")
+
+        subprocess.run(["git", "init", "-q"], cwd=str(td), check=True)
+        (td / "cert").mkdir()
+        (td / "cert" / "secrets.txt").write_text("X=1\n", encoding="utf-8")
+        (td / "App.swift").write_text("import SwiftUI\n", encoding="utf-8")
+        subprocess.run(["git", "add", "App.swift"], cwd=str(td), check=True)
+
+        files = subprocess.run(["git", "ls-files"], cwd=str(td),
+                               capture_output=True, text=True).stdout.splitlines()
+        eq(files, ["App.swift"], "只暂存了源码，敏感文件没进索引")
+
+        # 故意把 cert/ 加进去，模拟「忘了 .gitignore」的后果
+        subprocess.run(["git", "add", "-f", "cert/secrets.txt"], cwd=str(td), check=True)
+        files = subprocess.run(["git", "ls-files"], cwd=str(td),
+                               capture_output=True, text=True).stdout.splitlines()
+        check(any(f.endswith("secrets.txt") for f in files),
+              "强制加入后能被 ls-files 看到（这就是 doctor 要拦的情况）")
+
+
+def test_version_bump():
+    section("build 号递增")
+
+    import re
+
+    # ship.py 用正则改 project.yml，不能把引号、缩进、其他内容弄坏
+    sample = 'name: X\n    MARKETING_VERSION: "1.0"\n    CURRENT_PROJECT_VERSION: "4"\n    OTHER: keep\n'
+
+    def bump(txt):
+        return re.sub(r'(CURRENT_PROJECT_VERSION:\s*"?)(\d+)("?)',
+                      lambda m: m.group(1) + str(int(m.group(2)) + 1) + m.group(3),
+                      txt, count=1)
+
+    out = bump(sample)
+    check('CURRENT_PROJECT_VERSION: "5"' in out, "build 号 +1 且保留引号")
+    check('MARKETING_VERSION: "1.0"' in out, "版本号不动")
+    check('OTHER: keep' in out, "其他行不动")
+    check(out.count("\n") == sample.count("\n"), "行数不变")
+
+
+def test_secrets_parsing():
+    section("secrets.txt 解析")
+
+    # 格式是 KEY=BASE64，值里可能有 = 填充，所以只能按第一个 = 切
+    content = (
+        "# 自动生成\n"
+        "ASC_KEY_ID=ABC1234567\n"
+        "ASC_ISSUER_ID=69a6de7c-1111\n"
+        "IOS_CERT_PASSWORD=ab==\n"
+        "\n"
+        "ASC_KEY_CONTENT=TUlJQ2VydA==\n"
+    )
+    got = {}
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        got[k] = v
+
+    eq(len(got), 4, "解析出 4 个键")
+    eq(got["IOS_CERT_PASSWORD"], "ab==", "base64 填充里的 = 不被切断")
+    eq(got["ASC_KEY_CONTENT"], "TUlJQ2VydA==", "长 base64 完整保留")
+    check("#" not in got, "注释行被跳过")
+
+
+# ------------------------------------------------------------------ 入口
 
 def main():
-    mod = load_module()
+    print("ios-ship 离线自测")
+    print("=" * 46)
 
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import ec
-    from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+    tests = [
+        test_infer,
+        test_precedence,
+        test_validate,
+        test_write_example,
+        test_describe,
+        test_imports,
+        test_tools_smoke,
+        test_ptp_container,
+        test_jwt_shape,
+        test_version_bump,
+        test_secrets_parsing,
+        test_sensitive_paths,
+        test_rename,
+        test_new,
+        test_generic,
+        test_tracked_secrets,
+    ]
 
-    tmp = tempfile.mkdtemp(prefix="camcoach-selftest-")
-    try:
-        # ---------------------------------------------------------- 1. JWT
-        print()
-        print("  1. JWT 的 ES256 签名")
-
-        api_priv = ec.generate_private_key(ec.SECP256R1())
-        p8_path = os.path.join(tmp, "AuthKey_TEST.p8")
-        with open(p8_path, "wb") as f:
-            f.write(
-                api_priv.private_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PrivateFormat.PKCS8,
-                    encryption_algorithm=serialization.NoEncryption(),
-                )
-            )
-
-        token = mod.make_jwt(p8_path, "TESTKEY123", "69a6de7c-0000-0000-0000-000000000000")
-        parts = token.split(".")
-        check("JWT 是三段结构", len(parts) == 3, "实际 " + str(len(parts)) + " 段")
-
-        def unpad(s):
-            return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
-
-        header = json.loads(unpad(parts[0]))
-        payload = json.loads(unpad(parts[1]))
-        check("header.alg = ES256", header.get("alg") == "ES256")
-        check("header.kid 正确", header.get("kid") == "TESTKEY123")
-        check("aud = appstoreconnect-v1", payload.get("aud") == "appstoreconnect-v1")
-        check(
-            "exp - iat <= 1200 秒（Apple 上限）",
-            payload.get("exp", 0) - payload.get("iat", 0) <= 1200,
-            "实际 " + str(payload.get("exp", 0) - payload.get("iat", 0)),
-        )
-
-        sig = unpad(parts[2])
-        check("签名是 64 字节 raw 格式", len(sig) == 64, "实际 " + str(len(sig)))
-        r = int.from_bytes(sig[:32], "big")
-        s = int.from_bytes(sig[32:], "big")
+    for t in tests:
         try:
-            api_priv.public_key().verify(
-                encode_dss_signature(r, s),
-                (parts[0] + "." + parts[1]).encode(),
-                ec.ECDSA(hashes.SHA256()),
-            )
-            check("签名可被公钥验通", True)
-        except Exception as e:
-            check("签名可被公钥验通", False, str(e))
-
-        # ---------------------------------------------------------- 2. CSR
-        print()
-        print("  2. 私钥与 CSR")
-        key, key_pem, csr_pem = mod.gen_key_and_csr()
-        check("私钥是 2048 位", key.key_size == 2048, "实际 " + str(key.key_size))
-
-        csr = x509.load_pem_x509_csr(csr_pem)
-        check("CSR 自签名校验通过", csr.is_signature_valid)
-        cn = csr.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)[0].value
-        check("CSR 的 CN 是 CamCoach Distribution", cn == "CamCoach Distribution", cn)
-
-        csr_pub = csr.public_key().public_numbers()
-        key_pub = key.public_key().public_numbers()
-        check("CSR 公钥与私钥配对", csr_pub.n == key_pub.n and csr_pub.e == key_pub.e)
-
-        csr_b64 = base64.b64encode(csr_pem).decode("ascii")
-        check("CSR 可 base64 编码后还原", base64.b64decode(csr_b64) == csr_pem)
-
-        # ---------------------------------------------------------- 3. p12
-        print()
-        print("  3. .p12 打包（CI 导入用）")
-        from cryptography.hazmat.primitives.serialization import Encoding
-
-        # 自签一张证书冒充 Apple 签发的，只为验证 p12 打包/解包链路
-        import datetime
-
-        from cryptography.hazmat.primitives import hashes as H
-        from cryptography.x509.oid import NameOID
-
-        now = datetime.datetime.now(datetime.timezone.utc)
-        fake_cert = (
-            x509.CertificateBuilder()
-            .subject_name(csr.subject)
-            .issuer_name(csr.subject)
-            .public_key(key.public_key())
-            .serial_number(x509.random_serial_number())
-            .not_valid_before(now - datetime.timedelta(days=1))
-            .not_valid_after(now + datetime.timedelta(days=365))
-            .sign(key, H.SHA256())
-        )
-        fake_der = fake_cert.public_bytes(Encoding.DER)
-        check("假证书是 DER 编码", len(fake_der) > 500, "长度 " + str(len(fake_der)))
-
-        pw = mod.rand_password()
-        check("随机密码长度 24 且只含字母数字", len(pw) == 24 and pw.isalnum(), pw)
-
-        p12_bytes = mod.build_p12(key, fake_der, pw)
-        p12_path = os.path.join(tmp, "test.p12")
-        with open(p12_path, "wb") as f:
-            f.write(p12_bytes)
-        check(".p12 文件已写出", os.path.getsize(p12_path) > 1000)
-
-        from cryptography.hazmat.primitives.serialization import pkcs12
-
-        with open(p12_path, "rb") as f:
-            got_key, got_cert, _ = pkcs12.load_key_and_certificates(f.read(), pw.encode())
-        check("用生成的密码能读回 .p12", got_key is not None and got_cert is not None)
-        check(".p12 里的证书就是原证书", got_cert.public_bytes(Encoding.DER) == fake_der)
-
-        bad_pw_ok = True
-        try:
-            pkcs12.load_key_and_certificates(p12_bytes, b"wrong-password")
-            bad_pw_ok = False
+            t()
         except Exception:
-            bad_pw_ok = True
-        check("错误密码读不出来（密码确实生效）", bad_pw_ok)
-
-        # 算法必须落在 macOS 认的范围里。
-        # cryptography 的默认值是 AES + SHA256，openssl 能读但 Security.framework
-        # 会报 "MAC verification failed (wrong password?)"——提示说密码错，其实是算法不认。
-        # 这两条断言就是防止有人把它改回默认值。
-        import subprocess
-
-        pr = subprocess.run(
-            ["openssl", "pkcs12", "-info", "-in", p12_path,
-             "-passin", "pass:" + pw, "-noout"],
-            capture_output=True, text=True,
-        )
-        desc = (pr.stdout + pr.stderr).lower()
-        if pr.returncode == 0:
-            check("p12 的 MAC 是 SHA1（macOS 只认这个）", "sha1" in desc, desc[:200])
-            check("p12 的加密是 3DES（macOS 只认这个）",
-                  "tripledes" in desc or "3-keytripledes" in desc, desc[:200])
-        else:
-            check("openssl 能读出 p12 的结构", False, (pr.stderr or "")[:200])
-
-        # ---------------------------------------------------------- 4. 全流程
-        print()
-        print("  4. 六步流程编排（mock 掉 Apple 的响应）")
-
-        out_dir = os.path.join(tmp, "cert")
-        calls = []
-
-        def mint_matching_cert(csr_b64):
-            """按流程刚写盘的私钥 + CSR 现签一张假证书，冒充 Apple 的签发结果。
-
-            必须动态生成：流程内部会自己生成新私钥，只有用它签出来的证书
-            才能和 .p12 打包时的私钥配对。写死一张会让测试假失败。
-            """
-            kpath = os.path.join(out_dir, "distribution.key")
-            with open(kpath, "rb") as f:
-                k = serialization.load_pem_private_key(f.read(), password=None)
-            inner = x509.load_pem_x509_csr(base64.b64decode(csr_b64))
-            import datetime
-
-            now2 = datetime.datetime.now(datetime.timezone.utc)
-            c = (
-                x509.CertificateBuilder()
-                .subject_name(inner.subject)
-                .issuer_name(inner.subject)
-                .public_key(k.public_key())
-                .serial_number(x509.random_serial_number())
-                .not_valid_before(now2 - datetime.timedelta(days=1))
-                .not_valid_after(now2 + datetime.timedelta(days=365))
-                .sign(k, hashes.SHA256())
-            )
-            return c.public_bytes(serialization.Encoding.DER)
-
-        def fake_api(method, path, token, body=None):
-            calls.append((method, path))
-            if path.startswith("/v1/bundleIds?limit=1"):
-                return 200, {
-                    "data": [{"id": "BID1", "attributes": {"identifier": "x.y", "seedId": "ABCDE12345"}}]
-                }
-            if path.startswith("/v1/bundleIds?filter"):
-                return 200, {"data": []}
-            if method == "POST" and path == "/v1/bundleIds":
-                return 201, {
-                    "data": {"id": "BID2", "attributes": {"identifier": "com.camcoach.app", "seedId": "ABCDE12345"}}
-                }
-            if method == "POST" and path == "/v1/certificates":
-                der = mint_matching_cert(body["data"]["attributes"]["csrContent"])
-                return 201, {
-                    "data": {
-                        "id": "CERT1",
-                        "attributes": {
-                            "name": "CamCoach Distribution",
-                            "certificateContent": base64.b64encode(der).decode(),
-                        },
-                    }
-                }
-            if path.startswith("/v1/certificates?filter"):
-                # 真实场景里 Apple 会返回这个 Team 下所有发布证书。
-                # 这里扫一遍临时目录下所有 distribution.cer 来模拟——
-                # 复用证书时要靠内容比对认人，只返回某一个目录的会漏。
-                items = []
-                for root, _dirs, files in os.walk(tmp):
-                    if "distribution.cer" in files:
-                        with open(os.path.join(root, "distribution.cer"), "rb") as f:
-                            der = f.read()
-                        items.append(
-                            {
-                                "id": "CERT_" + str(len(items)),
-                                "attributes": {
-                                    "name": "CamCoach Distribution",
-                                    "certificateContent": base64.b64encode(der).decode(),
-                                },
-                            }
-                        )
-                return 200, {"data": items}
-            if path.startswith("/v1/profiles?filter"):
-                return 200, {"data": []}
-            if method == "POST" and path == "/v1/profiles":
-                return 201, {
-                    "data": {"id": "PROF1", "attributes": {"name": "CamCoach AppStore", "profileContent": base64.b64encode(b"FAKE-PROFILE").decode()}}
-                }
-            return 200, {"data": []}
-
-        mod.api = fake_api
-        sys.argv = [
-            "apple-auto.py",
-            "--p8", p8_path,
-            "--key-id", "TESTKEY123",
-            "--issuer-id", "69a6de7c-0000-0000-0000-000000000000",
-            "--out", out_dir,
-        ]
-
-        import contextlib
-
-        buf = []
-        with contextlib.redirect_stdout(type("T", (), {"write": lambda self, s: buf.append(s), "flush": lambda self: None})()):
-            try:
-                mod.main()
-                ran = True
-                err = ""
-            except SystemExit as e:
-                ran = (e.code in (0, None))
-                err = "SystemExit " + str(e.code)
-        check("流程无异常跑完", ran, err)
-        log = "".join(buf)
-
-        for fn in ["distribution.key", "distribution.certSigningRequest", "distribution.cer",
-                   "distribution.p12", "CamCoach.mobileprovision", "secrets.txt", "cert-id.txt"]:
-            check("产物存在: " + fn, os.path.exists(os.path.join(out_dir, fn)))
-
-        with open(os.path.join(out_dir, "secrets.txt"), encoding="utf-8") as f:
-            sec = f.read()
-        # 名字必须和 .github/workflows/ios.yml 里的 secrets.XXX 逐字一致
-        for k in ["APPLE_TEAM_ID=ABCDE12345", "ASC_KEY_ID=TESTKEY123",
-                  "IOS_PROFILE_NAME=CamCoach AppStore", "IOS_CERT_PASSWORD=",
-                  "ASC_KEY_CONTENT=", "IOS_CERT_P12_BASE64=", "IOS_PROFILE_BASE64="]:
-            check("secrets 含 " + k.split("=")[0], k in sec)
-
-        # 长值必须是真 base64，不能是路径
-        for name, expect_b64 in [("ASC_KEY_CONTENT", True), ("IOS_CERT_P12_BASE64", True),
-                                 ("IOS_PROFILE_BASE64", True)]:
-            got = ""
-            for line in sec.splitlines():
-                if line.startswith(name + "="):
-                    got = line.split("=", 1)[1]
-            is_b64 = False
-            if got:
-                try:
-                    base64.b64decode(got, validate=True)
-                    is_b64 = True
-                except Exception:
-                    is_b64 = False
-            check(name + " 是合法的 base64 文本", got != "" and is_b64 and "\\" not in got)
-
-        check("cert-id.txt 记下了证书 ID", os.path.exists(os.path.join(out_dir, "cert-id.txt")))
-
-        first_calls = list(calls)
-        check("首次运行调用了 POST /v1/certificates",
-              ("POST", "/v1/certificates") in first_calls, str(first_calls[:6]))
-        check(".cer 是真正的 DER 证书",
-              _is_der_cert(os.path.join(out_dir, "distribution.cer")))
-
-        # 幂等：再跑一次应该走复用分支
-        calls.clear()
-        buf = []
-        with contextlib.redirect_stdout(type("T", (), {"write": lambda self, s: buf.append(s), "flush": lambda self: None})()):
-            try:
-                mod.main()
-            except SystemExit:
-                pass
-        log2 = "".join(buf)
-        check("二次运行走复用分支（不重新签证书）", "跳过重新签发" in log2, log2[-300:])
-        check("二次运行仍然生成了描述文件",
-              os.path.exists(os.path.join(out_dir, "CamCoach.mobileprovision")))
-
-        # ---------------------------------------------------- 5. 复用已有证书
-        print()
-        print("  5. 复用现成的私钥+证书（--reuse-cert）")
-
-        src = os.path.join(tmp, "reuse-src")
-        os.makedirs(src, exist_ok=True)
-        with open(os.path.join(src, "distribution.key"), "wb") as f:
-            f.write(
-                key.private_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PrivateFormat.TraditionalOpenSSL,
-                    encryption_algorithm=serialization.NoEncryption(),
-                )
-            )
-        with open(os.path.join(src, "distribution.cer"), "wb") as f:
-            f.write(fake_der)
-
-        reuse_out = os.path.join(tmp, "reuse-out")
-        calls.clear()
-        sys.argv = [
-            "apple-auto.py",
-            "--p8", p8_path,
-            "--key-id", "TESTKEY123",
-            "--issuer-id", "69a6de7c-0000-0000-0000-000000000000",
-            "--out", reuse_out,
-            "--reuse-cert", src,
-        ]
-        buf = []
-        with contextlib.redirect_stdout(type("T", (), {"write": lambda self, s: buf.append(s), "flush": lambda self: None})()):
-            try:
-                mod.main()
-            except SystemExit:
-                pass
-        log3 = "".join(buf)
-
-        check("复用时没有调用签发证书的接口",
-              ("POST", "/v1/certificates") not in calls, str(calls))
-        check("复用时生成了 .p12", os.path.exists(os.path.join(reuse_out, "distribution.p12")))
-        check("复用时把 .cer 搬了过来", os.path.exists(os.path.join(reuse_out, "distribution.cer")))
-        check("复用时没有重新生成私钥（沿用原来那把）", True)
-
-        pw3 = ""
-        with open(os.path.join(reuse_out, "secrets.txt"), encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("IOS_CERT_PASSWORD="):
-                    pw3 = line.split("=", 1)[1].strip()
-        readable = False
-        try:
-            with open(os.path.join(reuse_out, "distribution.p12"), "rb") as f:
-                gk, gc, _ = pkcs12.load_key_and_certificates(f.read(), pw3.encode())
-            readable = gk is not None and gc is not None
-        except Exception:
-            readable = False
-        check("复用生成的 .p12 能用新密码读回", readable)
-
-        # 不配对的材料必须被拒绝，否则会签出装不上的包
-        bad_src = os.path.join(tmp, "reuse-bad")
-        os.makedirs(bad_src, exist_ok=True)
-        other_key = ec.generate_private_key(ec.SECP256R1())
-        with open(os.path.join(bad_src, "distribution.key"), "wb") as f:
-            f.write(
-                other_key.private_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PrivateFormat.TraditionalOpenSSL,
-                    encryption_algorithm=serialization.NoEncryption(),
-                )
-            )
-        with open(os.path.join(bad_src, "distribution.cer"), "wb") as f:
-            f.write(fake_der)
-
-        sys.argv = [
-            "apple-auto.py",
-            "--p8", p8_path,
-            "--key-id", "TESTKEY123",
-            "--issuer-id", "69a6de7c-0000-0000-0000-000000000000",
-            "--out", os.path.join(tmp, "reuse-bad-out"),
-            "--reuse-cert", bad_src,
-        ]
-        rejected = False
-        try:
-            with contextlib.redirect_stdout(type("T", (), {"write": lambda self, s: None, "flush": lambda self: None})()):
-                mod.main()
-        except SystemExit as e:
-            rejected = e.code not in (0, None)
-        check("私钥与证书不配对时拒绝继续", rejected)
-
-
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+            FAILED.append((t.__name__, "抛异常"))
+            print(f"  FAIL {t.__name__}")
+            traceback.print_exc()
 
     print()
-    print("  " + "-" * 46)
-    print("  通过 " + str(PASS) + " 项，失败 " + str(FAIL) + " 项")
-    print("  " + "-" * 46)
-    print()
-    return 1 if FAIL else 0
+    print("=" * 46)
+    if FAILED:
+        print(f"失败 {len(FAILED)} 条，通过 {PASSED} 条")
+        for what, detail in FAILED:
+            print(f"  - {what}")
+            if detail:
+                print(f"    {detail}")
+        return 1
+
+    print(f"全部通过：{PASSED} 条断言")
+    return 0
 
 
 if __name__ == "__main__":

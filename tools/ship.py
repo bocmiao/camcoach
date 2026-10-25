@@ -15,15 +15,18 @@
 
 这个脚本把整条链路固化下来，一条命令跑完，并且**在做之前先告诉你哪一步会失败**。
 
-## 五个子命令
+## 八个子命令
 
+    ship.py rename     一次改完工程名与 Bundle ID（11 处，手工改必漏）
     ship.py doctor     全面体检，只读，不改变任何东西
     ship.py setup      首次配置：证书 + p12 + Bundle ID + 描述文件 + secrets.txt
     ship.py secrets    把 secrets.txt 里的值写进 GitHub 仓库
-    ship.py release    发版：build 号 +1 → 推送 → 触发构建 → 挂进测试组
+    ship.py release    发版：build 号 +1 → 推送 → 触发构建 → 等 VALID → 挂进测试组
     ship.py status     分发状态速查（比 doctor 短）
+    ship.py init       生成 ship.config.json（可选，能从 project.yml 推断）
+    ship.py deps       检查/安装依赖
 
-建议顺序：`doctor` → `setup`（仅首次）→ `secrets`（仅首次）→ `release`。
+建议顺序：`rename` → `deps` → `init` → `doctor` → `setup`（仅首次）→ `secrets`（仅首次）→ `release`。
 
 ## 为什么要有 doctor
 
@@ -49,6 +52,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -88,6 +92,7 @@ def _load_module(alias, filename):
 
 aa = _load_module("apple_auto", "apple-auto.py")      # JWT / HTTP / p8 查找
 tf = _load_module("testflight_tools", "testflight.py")  # 测试组 / 分发
+sc = _load_module("ship_config", "shipconfig.py")     # 项目配置
 
 
 # ------------------------------------------------------------------ 终端输出
@@ -149,6 +154,44 @@ def gh(*args, check=False):
         return r.returncode, r.stdout, r.stderr
     except FileNotFoundError:
         return 127, "", "找不到 gh 命令（GitHub CLI 没装或不在 PATH 里）"
+
+
+def git(*args):
+    """调 git。返回 (returncode, stdout, stderr)。
+
+    cwd 用 IOS_DIR 而不是仓库根：ios/ 可能只是大仓库的一个子目录，
+    在这里跑 `git ls-files` 只会列出 ios/ 下的文件，正好是我们关心的范围。
+    """
+    try:
+        r = subprocess.run(["git"] + list(args), capture_output=True, text=True,
+                           errors="replace", cwd=str(IOS_DIR))
+        return r.returncode, r.stdout, r.stderr
+    except FileNotFoundError:
+        return 127, "", "找不到 git 命令"
+
+
+# 哪些文件名一旦被 git 跟踪就必须立刻处理。
+# 判断只看路径和扩展名，不读内容——读内容会把密码读进内存，没必要。
+SENSITIVE_SUFFIX = (".p8", ".p12", ".key", ".mobileprovision", ".cer")
+SENSITIVE_NAME = ("secrets.txt", "AuthKey.p8")
+
+
+def is_sensitive_path(path):
+    name = path.rsplit("/", 1)[-1]
+    if name in SENSITIVE_NAME:
+        return True
+    if name.startswith("AuthKey_") and name.endswith(".p8"):
+        return True
+    return path.lower().endswith(SENSITIVE_SUFFIX)
+
+
+def find_tracked_secrets():
+    """返回被 git 跟踪的敏感文件列表；不是 git 仓库时返回 None。"""
+    rc, out, _ = git("ls-files")
+    if rc != 0:
+        return None
+    return [line for line in out.splitlines()
+            if line.strip() and is_sensitive_path(line.strip())]
 
 
 def read_pyproject_version():
@@ -261,11 +304,15 @@ class Report:
 
     def warn(self, msg, detail="", fix=""):
         warn(msg, detail)
-        self.warnings.append((msg, fix))
+        # 同一件事会在多个分组里被检查到（比如缺 p8，第 1 组和第 2 组都会发现，
+        # 但给的修复提示角度不同）。按消息文本去重，保留第一次的提示。
+        if not any(m == msg for m, _ in self.warnings):
+            self.warnings.append((msg, fix))
 
     def bad(self, msg, detail="", fix=""):
         bad(msg, detail)
-        self.blockers.append((msg, fix))
+        if not any(m == msg for m, _ in self.blockers):
+            self.blockers.append((msg, fix))
 
     def summary(self):
         print()
@@ -308,17 +355,43 @@ def cmd_doctor(args):
                 fix="去 appstoreconnect.apple.com → 用户和访问 → 集成 → App Store Connect API → 团队密钥\n"
                     "建完立刻下载 .p8（离开页面就再也下不了），放到 cert 目录或 --p8 指定")
 
-    for f, label in [("distribution.key", "私钥"), ("distribution.cer", "证书"), ("distribution.p12", "p12")]:
+    chain_files = [("distribution.key", "私钥"),
+                   ("distribution.cer", "证书"),
+                   ("distribution.p12", "p12")]
+    missing_chain = []
+    for f, label in chain_files:
         p = cert_dir / f
         if p.exists():
             rep.ok(label, f"{f}  {p.stat().st_size} 字节")
         else:
-            rep.bad(f"缺 {f}", fix="跑 `ship.py setup` 生成")
+            missing_chain.append(f)
+    if missing_chain:
+        # 三件套是一次性生成的，拆成三条阻塞项只会让第一次体检看起来更糟。
+        rep.bad(f"证书链没生成（缺 {' / '.join(missing_chain)}）",
+                fix="跑 `ship.py setup` 一次生成私钥、证书、p12")
 
     if secrets:
         rep.ok("secrets.txt", f"{len(secrets)} 个键")
     else:
         rep.warn("没有 cert/secrets.txt", fix="跑 `ship.py setup` 生成")
+
+    # 凭据有没有被 git 跟踪。
+    # 这一条比「本地文件在不在」重要得多：文件在本地只是方便，进了 Git
+    # 就是永久记录——删掉文件、加 .gitignore 都改不了已经提交的历史。
+    tracked = find_tracked_secrets()
+    if tracked is None:
+        # 第 7 组会再遇到一次；两处用同一句 msg，靠 Report 的去重合成一条
+        rep.warn("这个目录不是 git 仓库", "跳过「凭据是否误提交」检查",
+                 fix="`release` 要 commit + push，得先 git init 或 clone")
+    elif tracked:
+        rep.bad(f"{len(tracked)} 个凭据文件已经被 git 跟踪",
+                fix="\n".join(tracked[:5])
+                    + ("\n..." if len(tracked) > 5 else "")
+                    + "\n立刻执行：git rm --cached <上面这些路径>"
+                    + "\n然后确认 .gitignore 里有 cert/ 、*.p8 、*.p12 、secrets.txt"
+                    + "\n如果推过公共仓库，按 docs/pitfalls.md 第 17 条评估要不要轮换密码")
+    else:
+        rep.ok("凭据没有进 Git")
 
     mv, bv = read_pyproject_version()
     if mv and bv is not None:
@@ -328,15 +401,29 @@ def cmd_doctor(args):
         rep.bad("project.yml 读不出版本号")
 
     # 图标——缺了上传时才报 90713，很容易拖到最后
-    icon = IOS_DIR / "CamCoach" / "Assets.xcassets" / "AppIcon.appiconset"
-    if any(icon.glob("*.png")) if icon.exists() else False:
+    xcode_dir = args.cfg.get("xcodeDir") or args.cfg.get("scheme")
+    icon = (IOS_DIR / xcode_dir / "Assets.xcassets" / "AppIcon.appiconset") if xcode_dir else None
+    if icon and icon.is_dir() and any(icon.glob("*.png")):
         rep.ok("App 图标")
+    elif icon and icon.is_dir():
+        rep.warn("AppIcon.appiconset 目录是空的",
+                 fix="放一张 1024×1024 无 alpha 的 png 进去，或跑 `python tools/make-icon.py`")
     else:
-        rep.warn("没找到 App 图标 png",
-                 fix="上传时才会报 90713 Missing CFBundleIconName / 90022 Missing 120x120")
+        rep.warn("没找到 App 图标",
+                 fix="上传时才会报 90713 Missing CFBundleIconName / 90022 Missing 120x120\n"
+                     "需要 <源码目录>/Assets.xcassets/AppIcon.appiconset/ 和 project.yml 里的\n"
+                     "ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon（这一行不能少）")
 
     # ---------- 2. 凭据与账号
     rep.start("凭据与账号")
+    # make_jwt 里一 import 就抛 ModuleNotFoundError，把「装个包」这件事
+    # 变成一段谁也看不懂的堆栈。先拦下来，后面几组都要用它，直接收尾。
+    if not check_dep("import cryptography"):
+        rep.bad("缺 python 包 cryptography",
+                fix="跑 `python tools/ship.py deps`\n"
+                    "它负责证书申请与 API 鉴权（生成 CSR、签 ES256 JWT），\n"
+                    "缺了它第 2 组之后的检查都跑不了")
+        return rep.summary()
     token, secrets, err = api_token(args)
     if err:
         rep.bad(err, fix="确认 cert/secrets.txt 里有 ASC_KEY_ID / ASC_ISSUER_ID")
@@ -363,35 +450,39 @@ def cmd_doctor(args):
     bundle_id = args.bundle_id
     st, r = aa.api("GET", f"/v1/bundleIds?filter[identifier]={bundle_id}", token)
     ids = r.get("data", []) if st < 300 else []
-    if ids:
+    bundle_ok = bool(ids)
+    if bundle_ok:
         rep.ok("Bundle ID 已注册", bundle_id)
     else:
+        # 不在这里 return：后面「证书 / 描述文件 / GitHub」三组不依赖它，
+        # 提前返回的话用户要改一处跑一次，改三处就得跑四轮。
         rep.bad(f"Bundle ID 未注册：{bundle_id}",
                 fix="跑 `ship.py setup` 会自动建；或先在后台 Identifiers 里建一个")
-        rep.summary()
-        return 1
 
     # ---------- 3. App 记录
     rep.start("App 记录")
-    st, r = aa.api("GET", f"/v1/apps?filter[bundleId]={bundle_id}", token)
-    apps = r.get("data", []) if st < 300 else []
-    if not apps:
-        rep.bad("App Store Connect 里没有这个 App 的记录",
-                fix="Apple 没有开放创建 App 记录的 API，只能手动建一次：\n"
-                    "appstoreconnect.apple.com → 我的 App → + → 新建 App\n"
-                    "名称 / 主要语言 / Bundle ID 选上面那个 / SKU 随便填一个唯一值")
-        rep.summary()
-        return 1
+    app = None
+    if not bundle_ok:
+        note("跳过：Bundle ID 还没注册，不会有 App 记录")
+    else:
+        st, r = aa.api("GET", f"/v1/apps?filter[bundleId]={bundle_id}", token)
+        apps = r.get("data", []) if st < 300 else []
+        if apps:
+            app = apps[0]
+            app_name = app["attributes"]["name"]
+            state["app"] = app
+            rep.ok("App 记录存在", f"{app_name}  App ID {app['id']}")
 
-    app = apps[0]
-    app_name = app["attributes"]["name"]
-    state["app"] = app
-    rep.ok("App 记录存在", f"{app_name}  App ID {app['id']}")
-
-    if re.search(r"\b(sony|canon|nikon|fujifilm|panasonic|leica|apple)\b", app_name, re.I):
-        rep.warn(f"App 名含第三方商标：{app_name}",
-                 fix="内部 TestFlight 不受影响，但外部测试和上架会被 App Review 拒（指南 5.2.1）。\n"
-                     "只需在后台改「App 信息 → 名称」，不耗 build 号、不用重新构建。")
+            if re.search(r"\b(sony|canon|nikon|fujifilm|panasonic|leica|apple)\b",
+                         app_name, re.I):
+                rep.warn(f"App 名含第三方商标：{app_name}",
+                         fix="内部 TestFlight 不受影响，但外部测试和上架会被 App Review 拒（指南 5.2.1）。\n"
+                             "只需在后台改「App 信息 → 名称」，不耗 build 号、不用重新构建。")
+        else:
+            rep.bad("App Store Connect 里没有这个 App 的记录",
+                    fix="Apple 没有开放创建 App 记录的 API，只能手动建一次：\n"
+                        "appstoreconnect.apple.com → 我的 App → + → 新建 App\n"
+                        "名称 / 主要语言 / Bundle ID 选上面那个 / SKU 随便填一个唯一值")
 
     # ---------- 4. 证书
     rep.start("证书")
@@ -424,61 +515,67 @@ def cmd_doctor(args):
 
     # ---------- 6. 构建与分发
     rep.start("构建与分发")
-    st, r = aa.api("GET", f"/v1/builds?filter[app]={app['id']}&sort=-version&limit=5", token)
-    builds = r.get("data", []) if st < 300 else []
-    if not builds:
-        rep.warn("还没有任何构建", fix="跑 `ship.py release`")
+    if app is None:
+        note("跳过：这一组依赖 App 记录，上面那条建完再跑一次")
     else:
-        latest = builds[0]
-        ver = latest["attributes"]["version"]
-        ps = latest["attributes"]["processingState"]
-        rep.ok(f"最新 build {ver}", ps) if ps == "VALID" else rep.warn(f"最新 build {ver}", ps)
-
-        if bv is not None and ver == str(bv):
-            rep.ok("build 号已用掉", f"project.yml 现在是 {bv}，就是这一个")
-            rep.warn(f"下次发版会撞号：build {bv} 已经上传过，且上传不可撤销",
-                     fix="跑 `ship.py release`，它会自动 +1")
-        elif bv is not None and int(ver) > bv:
-            rep.bad(f"project.yml 的 build 号（{bv}）比线上最新的（{ver}）还小",
-                    fix="上传会被拒：bundle version must be higher than previously uploaded")
+        st, r = aa.api("GET", f"/v1/builds?filter[app]={app['id']}&sort=-version&limit=5", token)
+        builds = r.get("data", []) if st < 300 else []
+        if not builds:
+            rep.warn("还没有任何构建", fix="跑 `ship.py release`")
         else:
-            rep.ok("build 号可用", f"下一个将是 {bv + 1 if bv else '?'}")
+            latest = builds[0]
+            ver = latest["attributes"]["version"]
+            ps = latest["attributes"]["processingState"]
+            rep.ok(f"最新 build {ver}", ps) if ps == "VALID" else rep.warn(f"最新 build {ver}", ps)
 
-        # 测试组是「上传成功但装不上」的元凶
-        st, g = aa.api("GET", f"/v1/betaGroups?filter[app]={app['id']}&limit=20", token)
-        groups = g.get("data", []) if st < 300 else []
-        internal = [x for x in groups if x["attributes"].get("isInternalGroup")]
-        if not internal:
-            rep.bad("没有任何内部测试组 —— TestFlight 里会是空的",
-                    fix="跑 `ship.py release`，或 `testflight.py attach`")
-        else:
-            for grp in internal:
-                gd, gb, gt = tf.group_detail(aa, token, grp["id"])
-                vers = [x["attributes"]["version"] for x in gb]
-                mails = [x["attributes"].get("email") for x in gt]
-                if vers:
-                    rep.ok(f"内部组「{grp['attributes']['name']}」", f"含 build {vers}")
-                else:
-                    rep.warn(f"内部组「{grp['attributes']['name']}」是空的",
-                             fix="跑 `ship.py release` 把 build 挂进去")
-                if mails:
-                    rep.ok("测试员", str(mails))
-                else:
-                    rep.warn("内部组里没有测试员",
-                             fix="`testflight.py attach` 会把你自己的账号加进去")
+            if bv is not None and ver == str(bv):
+                rep.ok("build 号已用掉", f"project.yml 现在是 {bv}，就是这一个")
+                rep.warn(f"下次发版会撞号：build {bv} 已经上传过，且上传不可撤销",
+                         fix="跑 `ship.py release`，它会自动 +1")
+            elif bv is not None and int(ver) > bv:
+                rep.bad(f"project.yml 的 build 号（{bv}）比线上最新的（{ver}）还小",
+                        fix="上传会被拒：bundle version must be higher than previously uploaded")
+            else:
+                rep.ok("build 号可用", f"下一个将是 {bv + 1 if bv else '?'}")
 
-        st, bl = aa.api("GET", f"/v1/betaBuildLocalizations?filter[build]={latest['id']}", token)
-        if st < 300 and bl.get("data"):
-            rep.ok("TestFlight 测试文案", f"{len(bl['data'])} 条")
-        else:
-            rep.warn("build 没有「本次测试内容」",
-                     fix="TestFlight 里会显示空白，不影响安装；`testflight.py attach` 会补")
+            # 测试组是「上传成功但装不上」的元凶
+            st, g = aa.api("GET", f"/v1/betaGroups?filter[app]={app['id']}&limit=20", token)
+            groups = g.get("data", []) if st < 300 else []
+            internal = [x for x in groups if x["attributes"].get("isInternalGroup")]
+            if not internal:
+                rep.bad("没有任何内部测试组 —— TestFlight 里会是空的",
+                        fix="跑 `ship.py release`，或 `testflight.py attach`")
+            else:
+                for grp in internal:
+                    gd, gb, gt = tf.group_detail(aa, token, grp["id"])
+                    vers = [x["attributes"]["version"] for x in gb]
+                    mails = [x["attributes"].get("email") for x in gt]
+                    if vers:
+                        rep.ok(f"内部组「{grp['attributes']['name']}」", f"含 build {vers}")
+                    else:
+                        rep.warn(f"内部组「{grp['attributes']['name']}」是空的",
+                                 fix="跑 `ship.py release` 把 build 挂进去")
+                    if mails:
+                        rep.ok("测试员", str(mails))
+                    else:
+                        rep.warn("内部组里没有测试员",
+                                 fix="`testflight.py attach` 会把你自己的账号加进去")
+
+            st, bl = aa.api("GET", f"/v1/betaBuildLocalizations?filter[build]={latest['id']}", token)
+            if st < 300 and bl.get("data"):
+                rep.ok("TestFlight 测试文案", f"{len(bl['data'])} 条")
+            else:
+                rep.warn("build 没有「本次测试内容」",
+                         fix="TestFlight 里会显示空白，不影响安装；`testflight.py attach` 会补")
 
     # ---------- 7. GitHub
     rep.start("GitHub 仓库")
     rc, out, err = gh("secret", "list")
     if rc == 127:
         rep.warn("没装 gh CLI", fix="或者跳过——不影响构建，只影响从命令行写 secrets")
+    elif "not a git repository" in err.lower():
+        rep.warn("这个目录不是 git 仓库",
+                 fix="跳过 secrets 检查；`release` 要 commit + push，得先 git init 或 clone")
     elif rc != 0:
         rep.warn("读不到仓库 secrets", err.strip()[:120])
     else:
@@ -509,11 +606,14 @@ def cmd_doctor(args):
 
 def cmd_setup(args):
     """转调 apple-auto.py。它已经把整条证书链做完了，这里只负责把参数对齐。"""
+    # --cert-dir 要真的生效：doctor 用它找材料，setup 却写死 tools/cert 的话，
+    # 用户指定了目录会两边对不上（材料写进 A、体检去 B 找）。
+    out_dir = Path(args.cert_dir) if args.cert_dir else (HERE / "cert")
     argv = [
         sys.executable, str(HERE / "apple-auto.py"),
         "--bundle-id", args.bundle_id,
         "--profile", args.profile,
-        "--out", str(HERE / "cert"),
+        "--out", str(out_dir),
     ]
     if args.p8:
         argv += ["--p8", args.p8]
@@ -573,6 +673,195 @@ def cmd_secrets(args):
     return 0
 
 
+# ------------------------------------------------------------------ rename
+
+# 名字在三个文件里散成 11 处：project.yml 里 7 处、两个 workflow 里 4 处。
+# 手工改必漏，而漏了不会立刻报错——要到 CI 的 archive 阶段才说找不到 scheme。
+#
+# 两个文件用不同的规则：workflow 顶部的 `name:` 是工作流名字，
+# 不是工程名，不能跟着改。
+_PROJECT_YML_RULES = [
+    (r"^(name:\s*)\S+", "name"),                          # 顶层，.xcodeproj 的名字
+    (r"(bundleIdPrefix:\s*)\S+", "prefix"),
+    (r"(PRODUCT_BUNDLE_IDENTIFIER:\s*)\S+", "bundle"),
+    (r"(CFBundleDisplayName:\s*)\S+", "name"),
+]
+_WORKFLOW_RULES = [
+    (r"(\bPROJECT:\s*)\S+", "name"),
+    (r"(\bSCHEME:\s*)\S+", "name"),
+    (r"(\bAPP_NAME:\s*)\S+", "name"),
+    (r"(\bBUNDLE_ID:\s*)\S+", "bundle"),
+]
+
+
+def _rewrite_names(ios_dir, old, new, new_bundle, dry_run=False):
+    """改 project.yml 与两个 workflow 里的名字。
+
+    返回 [(相对路径, [(行号, 旧行, 新行), ...]), ...]。
+    """
+    ios_dir = Path(ios_dir)
+    prefix = ".".join(new_bundle.split(".")[:-1]) or new_bundle
+    result = []
+
+    for rel in ("project.yml", ".github/workflows/ios.yml", ".github/workflows/validate.yml"):
+        path = ios_dir / rel
+        if not path.exists():
+            continue
+        rules = _PROJECT_YML_RULES if path.name == "project.yml" else _WORKFLOW_RULES
+        lines = path.read_text(encoding="utf-8").splitlines()
+        hits, out = [], []
+        for i, ln in enumerate(lines, 1):
+            if ln.lstrip().startswith("#"):
+                out.append(ln)
+                continue
+            before = ln
+            for pattern, kind in rules:
+                if not re.search(pattern, ln):
+                    continue
+                val = {"name": new, "bundle": new_bundle, "prefix": prefix}[kind]
+                ln = re.sub(pattern, lambda mm: mm.group(1) + val, ln, count=1)
+            # 剩下的旧名：targets 段、schemes 段、build.targets 里的键
+            if old and old != new and old in ln:
+                ln = ln.replace(old, new)
+            if ln != before:
+                hits.append((i, before.strip(), ln.strip()))
+            out.append(ln)
+
+        if not hits:
+            continue
+        result.append((rel, hits))
+        if not dry_run:
+            path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+    return result
+
+
+def cmd_new(args):
+    """从仓库里的 template 建一个新项目：复制 + 改名，一条命令。
+
+    存在的理由：README 原来让用户敲 `cp -r template/. <你的iOS项目>/ios`，
+    而 Windows 的 cmd 里没有 cp，`<...>` 还会被当成重定向符。
+    `new` 只用 Python 标准库，三个平台都能跑。
+    """
+    tpl = HERE.parent / "template"
+    if not tpl.is_dir():
+        bad("找不到 template 目录", str(tpl))
+        note("`new` 要在 clone 下来的仓库里跑：")
+        note("  git clone https://github.com/bocmiao/ios-ship")
+        note("  python ios-ship/tools/ship.py new PhotoHelper --bundle-id com.you.photohelper")
+        return 1
+
+    if not args.target:
+        bad("要给一个目标目录名", "例如：ship.py new PhotoHelper --bundle-id com.you.photohelper")
+        return 1
+
+    dest = Path(args.target).expanduser()
+    if not dest.is_absolute():
+        dest = (Path.cwd() / dest).resolve()
+    ios = dest / "ios"
+
+    if ios.exists() and any(ios.iterdir()) and not args.force:
+        bad(f"{ios} 已经存在且不是空的", "换个目录名，或加 --force 覆盖同名文件")
+        return 1
+
+    name = (args.app_name or dest.name).strip()
+    if not re.match(r"^[A-Za-z0-9_]+$", name):
+        bad("工程名只能用字母、数字、下划线", f"收到：{name}")
+        note("可以显式指定：--app-name PhotoHelper")
+        return 1
+
+    bundle = (args.bundle_id or "").strip()
+    if not bundle:
+        bad("要给 --bundle-id", "格式是反域名，例如 com.yourname.photohelper")
+        note("它会成为 App 的唯一标识，上架后不能改")
+        return 1
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9.\-]+$", bundle) or "." not in bundle:
+        bad("Bundle ID 格式不对", f"收到：{bundle}")
+        return 1
+
+    ios.mkdir(parents=True, exist_ok=True)
+    # 不复制 cert（可能藏着别人的凭据）、不复制缓存和上次的配置
+    ignore = shutil.ignore_patterns("__pycache__", "cert", "ship.config.json", "*.pyc")
+    shutil.copytree(HERE, ios / "tools", ignore=ignore, dirs_exist_ok=True)
+    shutil.copytree(tpl, ios, dirs_exist_ok=True)
+
+    m = re.search(r"^name:\s*(\S+)", (ios / "project.yml").read_text(encoding="utf-8"), re.M)
+    old = m.group(1) if m else ""
+    result = _rewrite_names(ios, old, name, bundle)
+    changed = sum(len(h) for _, h in result)
+
+    print(f"\n  已创建 {dest}")
+    print(f"  工程名    {old}  →  {name}")
+    print(f"  Bundle ID →  {bundle}")
+    print(f"  改写了 {changed} 处（project.yml 与两个 workflow）")
+    print()
+    print("  里面是一个能编译的最小 SwiftUI 工程：")
+    print(f"    {ios / 'App' / 'ContentView.swift'}   改这个文件写你的界面")
+    print()
+    print("  下一步：")
+    print(f"    cd {ios}")
+    print("    python tools/ship.py deps")
+    print("    python tools/ship.py init")
+    print("    python tools/ship.py doctor")
+    return 0
+
+
+def cmd_rename(args):
+    """把工程名与 Bundle ID 改到所有出现的位置。
+
+    只改配置，不动 App 源码和目录名——源码目录叫 App 还是 Source 都不影响。
+    """
+    yml = IOS_DIR / "project.yml"
+    if not yml.exists():
+        bad("当前目录没有 project.yml", str(IOS_DIR))
+        return 1
+
+    txt = yml.read_text(encoding="utf-8")
+    m = re.search(r"^name:\s*(\S+)", txt, re.M)
+    old = m.group(1) if m else ""
+    mb = re.search(r"PRODUCT_BUNDLE_IDENTIFIER:\s*(\S+)", txt)
+    old_bundle = mb.group(1) if mb else ""
+
+    new = (args.app_name or "").strip()
+    if not new:
+        bad("要给 --app-name", f"当前工程名：{old or '(读不到)'}")
+        return 1
+    if not re.match(r"^[A-Za-z0-9_]+$", new):
+        bad("工程名只能用字母、数字、下划线", f"收到：{new}")
+        note("它会变成 target 名和 scheme 名，不能有空格、连字符、中文")
+        return 1
+
+    new_bundle = (args.bundle_id or old_bundle).strip()
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9.\-]+$", new_bundle):
+        bad("Bundle ID 格式不对", f"收到：{new_bundle}")
+        return 1
+
+    print(f"\n  工程名    {old or '(空)'}  →  {new}")
+    print(f"  Bundle ID {old_bundle or '(空)'}  →  {new_bundle}")
+    print()
+
+    result = _rewrite_names(IOS_DIR, old, new, new_bundle, dry_run=args.dry_run)
+    changed = sum(len(h) for _, h in result)
+    for rel, hits in result:
+        print(f"  {rel}  {len(hits)} 处")
+        for i, before, after in hits:
+            print(f"    {i:3d}  {before}")
+            print(f"         {after}")
+
+    if not changed:
+        print(f"  没有可改的行。工程名可能已经是 {new}。")
+        return 0
+    if args.dry_run:
+        print(f"\n{C.D}dry-run，{changed} 处未写入。去掉 --dry-run 执行。{C.X}")
+        return 0
+
+    print(f"\n{C.G}改了 {changed} 处。{C.X}")
+    if old and old != new and (IOS_DIR / old).is_dir():
+        print(f"  源码目录 {old}/ 还在：可以改名并同步 project.yml 的 sources，也可以不改")
+    print("  下一步：python tools/ship.py init（重建配置）→ doctor")
+    return 0
+
+
 # ------------------------------------------------------------------ release
 
 def cmd_release(args):
@@ -602,15 +891,25 @@ def cmd_release(args):
     ok(f"build 号 {old} → {new}")
 
     # 2. 提交推送
-    gst = subprocess.run(["git", "status", "--porcelain"], capture_output=True,
-                         text=True, errors="replace", cwd=str(IOS_DIR))
-    changes = [x for x in gst.stdout.splitlines() if x.strip()]
-    if changes:
-        subprocess.run(["git", "add", "-A"], cwd=str(IOS_DIR))
+    # 只提交 project.yml。发版时工作区里常有改了一半的代码，
+    # `git add -A` 会把它一起塞进 release 提交推上去，事后很难拆开。
+    st_yml = subprocess.run(["git", "status", "--porcelain", "project.yml"],
+                            capture_output=True, text=True, errors="replace", cwd=str(IOS_DIR))
+    if st_yml.stdout.strip():
+        subprocess.run(["git", "add", "project.yml"], cwd=str(IOS_DIR))
         subprocess.run(["git", "commit", "-m", f"release: build {new}"], cwd=str(IOS_DIR))
-        ok(f"已提交（{len(changes)} 个文件变更）")
+        ok("已提交 project.yml")
     else:
-        note("没有文件变更，直接推送当前 HEAD")
+        note("project.yml 没有改动，直接推送当前 HEAD")
+
+    st_all = subprocess.run(["git", "status", "--porcelain"],
+                            capture_output=True, text=True, errors="replace", cwd=str(IOS_DIR))
+    others = [x for x in st_all.stdout.splitlines()
+              if x.strip() and "project.yml" not in x]
+    if others:
+        warn(f"工作区还有 {len(others)} 个文件没提交",
+             "本次只提交 project.yml，这些留在工作区，不影响构建")
+
     r = subprocess.run(["git", "push", "origin", "HEAD"], capture_output=True,
                        text=True, errors="replace", cwd=str(IOS_DIR))
     if r.returncode != 0:
@@ -618,14 +917,14 @@ def cmd_release(args):
         return 1
     ok("已推送")
 
-    # 3. 触发（ios.yml 已改成只手动触发，push 不会自动上传）
+    # 3. 触发（ios.yml 只手动触发，push 不会自动上传）
     rc, out, err = gh("workflow", "run", "ios.yml", "--ref", "main")
     if rc != 0:
         bad("触发流水线失败", err.strip()[:200])
         return 1
     ok("流水线已触发")
 
-    # 等 run 出现
+    # 等 run 出现在列表里（刚触发时还没编号，通常 3–10 秒）
     run_id = None
     for _ in range(20):
         time.sleep(3)
@@ -640,47 +939,115 @@ def cmd_release(args):
     if not run_id:
         warn("没拿到 run id，去网页看进度", "Actions → iOS 构建并上传 TestFlight")
         return 1
-    note(f"run {run_id}（约 4 分钟）")
 
-    # 4. 等结果
-    print(f"\n{C.D}构建中", end="", flush=True)
-    conclusion = None
-    for _ in range(120):
-        time.sleep(15)
-        rc, out, _ = gh("run", "view", str(run_id), "--json", "status,conclusion")
-        if rc != 0:
-            print(".", end="", flush=True)
-            continue
-        try:
-            d = json.loads(out)
-        except Exception:
-            continue
-        if d.get("status") == "completed":
-            conclusion = d.get("conclusion")
-            break
-        print(".", end="", flush=True)
-    print(C.X)
-
-    if conclusion != "success":
-        bad(f"构建失败：{conclusion}")
+    # 4. 等结果：交给 gh 自己盯，--exit-status 把结论变成退出码
+    note(f"run {run_id}，约 4 分钟")
+    print()
+    wr = subprocess.run(["gh", "run", "watch", str(run_id), "--exit-status", "--interval", "15"],
+                        cwd=str(IOS_DIR))
+    if wr.returncode != 0:
+        bad("构建失败或被取消")
         note(f"看日志：gh run view {run_id} --log-failed")
         return 1
     ok("构建并上传成功")
 
-    # 5. 挂进内部测试组——这一步漏了，TestFlight 里就是空的
+    # 5. 挂进内部测试组
+    # upload 用的是 skip_waiting_for_build_processing，workflow 成功的那一刻
+    # Apple 那边往往还在处理。先等到 VALID 再挂，否则会把成功报成失败。
     print()
     h("分发")
     gid, gname = tf.ensure_internal_group(aa, token, app["id"])
-    ver = tf.ensure_build_attached(aa, token, gid, app["id"])
+    target = tf.wait_for_build(aa, token, app["id"], want=new)
+    ver = target["attributes"]["version"]
+    tf.ensure_build_attached(aa, token, gid, app["id"], want=ver)
     tf.ensure_self_in_group(aa, token, gid)
-
-    builds = tf.list_builds(aa, token, app["id"], limit=10)
-    bid = next((b["id"] for b in builds if b["attributes"]["version"] == str(ver)), None)
-    if bid:
-        tf.ensure_localizations(aa, token, app["id"], bid, args.feedback_email)
+    tf.ensure_localizations(aa, token, app["id"], target["id"], args.feedback_email,
+                            args.cfg.get("testflightDescription"),
+                            args.cfg.get("testflightWhatsNew"))
 
     print(f"\n{C.G}完成。{C.X} build {ver} 已进入内部组「{gname}」。")
     print("iPhone 打开 TestFlight 就能装，通常几分钟内可见。")
+    return 0
+
+
+# ------------------------------------------------------------------ 依赖
+
+# 真依赖清单。写在这里而不是散在文档里，因为文档会过期、这个不会。
+#   cryptography —— CSR 生成、ES256 签 JWT。setup / doctor / status / release 要用。
+#   pillow       —— 只有 make-icon.py 画图要用，可选。
+DEPS = [
+    ("cryptography", "import cryptography", True,
+     "证书申请与 API 鉴权（CSR / ES256 JWT）"),
+    ("pillow", "from PIL import Image", False,
+     "生成 App 图标（可选，你有自己的 PNG 就不用装）"),
+]
+
+
+def check_dep(import_stmt):
+    try:
+        exec(import_stmt, {})
+        return True
+    except Exception:
+        return False
+
+
+def cmd_deps(args):
+    """检查并安装依赖。装的时候用当前这个 Python 的 -m pip，保证装进同一个环境。"""
+    print()
+    missing = []
+    for name, stmt, required, why in DEPS:
+        has = check_dep(stmt)
+        tag = "必需" if required else "可选"
+        if has:
+            ok(f"{name}（{tag}）", why)
+        else:
+            warn(f"{name} 没装（{tag}）", why)
+            missing.append((name, required))
+
+    print()
+    if not missing:
+        print(f"{C.G}依赖齐了。{C.X}")
+        return 0
+
+    to_install = [n for n, req in missing if req or args.install_optional]
+    if not to_install:
+        print(f"{C.Y}只是缺可选的包，不影响发版。{C.X}")
+        print(f"  要装的话：{sys.executable} -m pip install pillow")
+        return 0
+
+    pkgs = " ".join(to_install)
+    cmd = [sys.executable, "-m", "pip", "install"] + to_install
+    print(f"{C.D}将执行：{' '.join(cmd)}{C.X}")
+
+    if args.dry_run:
+        print(f"{C.D}dry-run，没有真的装。{C.X}")
+        return 0
+
+    if not args.yes:
+        if not sys.stdin.isatty():
+            print(f"\n{C.Y}非交互环境，没有自动安装。请手动执行上面的命令。{C.X}")
+            return 1
+        ans = input("现在安装吗？[Y/n] ").strip().lower()
+        if ans not in ("", "y", "yes"):
+            print(f"\n{C.Y}没装。需要的时候跑 `ship.py deps --yes`。{C.X}")
+            return 1
+
+    rc = subprocess.call(cmd)
+    if rc != 0:
+        bad("安装失败")
+        note("常见原因：没联网、公司代理、或 pip 版本太旧")
+        note(f"可以先试 {sys.executable} -m ensurepip --upgrade")
+        return 1
+
+    # 装完立刻复验，别让「pip 说成功但其实装到别的解释器去了」蒙混过关
+    print()
+    still = [name for name, stmt, _req, _why in DEPS
+             if name in to_install and not check_dep(stmt)]
+    if still:
+        bad(f"装完了还是找不到：{', '.join(still)}")
+        note(f"确认装的时候用的是这个解释器：{sys.executable}")
+        return 1
+    print(f"{C.G}装好了，现在可以跑 `ship.py setup`。{C.X}")
     return 0
 
 
@@ -691,18 +1058,23 @@ def main():
         description="没有 Mac 也能把 iOS App 发到 TestFlight",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""示例：
+  ship.py rename --app-name PhotoHelper --bundle-id com.you.photohelper
   ship.py doctor
   ship.py setup --bundle-id com.example.myapp
-  ship.py setup --bundle-id com.example.myapp --reuse-cert ../old/cert
+  ship.py setup --reuse-cert ../old/cert
   ship.py secrets
   ship.py release
 """,
     )
     ap.add_argument("action",
-                    choices=["doctor", "setup", "secrets", "release", "status"],
+                    choices=["new", "doctor", "setup", "secrets", "release", "status",
+                             "init", "deps", "rename"],
                     help="要做什么")
-    ap.add_argument("--bundle-id", default="com.bocmiao.camcoach")
-    ap.add_argument("--profile", default="CamCoach AppStore")
+    ap.add_argument("target", nargs="?", default="",
+                    help="new 的目标目录名，例如 PhotoHelper")
+    ap.add_argument("--app-name", default="", help="工程名（rename / new 用，字母数字下划线）")
+    ap.add_argument("--bundle-id", default="", help="不填就从 project.yml / ship.config.json 推断")
+    ap.add_argument("--profile", default="", help="描述文件名，默认 <scheme> AppStore")
     ap.add_argument("--p8", default="")
     ap.add_argument("--key-id", default="")
     ap.add_argument("--issuer", default="")
@@ -712,15 +1084,40 @@ def main():
                     help="复用已有证书目录（含 distribution.key / distribution.cer）")
     ap.add_argument("--force", action="store_true", help="setup 时强制重新生成")
     ap.add_argument("--yes", "-y", action="store_true", help="release 时跳过确认")
-    ap.add_argument("--dry-run", action="store_true", help="secrets 时只打印不写入")
-    ap.add_argument("--feedback-email", default="noreply@example.com")
+    ap.add_argument("--dry-run", action="store_true", help="secrets / deps 时只打印不执行")
+    ap.add_argument("--install-optional", action="store_true",
+                    help="deps 时连可选的 Pillow 一起装")
+    ap.add_argument("--feedback-email", default="",
+                    help="TestFlight 反馈邮箱，默认取 ship.config.json 或 noreply@example.com")
     args = ap.parse_args()
+
+    # ---------- new：从 template 建一个新项目，只在仓库里跑
+    if args.action == "new":
+        return cmd_new(args)
+
+    # ---------- deps：查/装依赖，不碰项目配置
+    if args.action == "deps":
+        return cmd_deps(args)
+
+    # ---------- init：只生成样板配置，不动任何东西
+    if args.action == "init":
+        target = IOS_DIR / "ship.config.json"
+        if target.exists() and not args.force:
+            warn(f"{target} 已存在", "要覆盖加 --force")
+            return 1
+        _, filled = sc.write_example(target, IOS_DIR)
+        ok(f"已生成 {target}")
+        if filled:
+            note(f"已从 project.yml 自动填好：{', '.join(filled)}")
+        note("其余字段可留空：teamId 从 secrets.txt 兜底，TestFlight 文案有通用默认值")
+        note("改完跑 `ship.py doctor` 看还缺什么")
+        return 0
 
     # doctor / release 要读 project.yml（版本号、图标）和 git 仓库。
     # 如果这个脚本被直接放在别处跑（比如刚从 skill 里复制出来），
     # 报「找不到 project.yml」比抛一堆 FileNotFoundError 好懂得多。
     # status 只查 API，不依赖本地工程，所以不拦。
-    if args.action in ("doctor", "release"):
+    if args.action in ("doctor", "release", "rename"):
         if not (IOS_DIR / "project.yml").exists():
             print(f"\n{C.R}这个脚本得放在 iOS 项目的 tools/ 目录下。{C.X}\n")
             print(f"  当前位置：{HERE}")
@@ -735,8 +1132,52 @@ def main():
             print(f"  只是想配置证书的话，`setup` 和 `secrets` 不需要 project.yml，可以直接跑。")
             return 1
 
+    # ---------- 统一加载配置：命令行 > ship.config.json > project.yml 推断
+    cfg = sc.load(IOS_DIR, {"bundleId": args.bundle_id, "profileName": args.profile})
+
+    # 每个命令真正需要什么，就只校验什么。
+    #   doctor / release / status 要认工程：bundleId + scheme 都得有
+    #   setup 只要能建 Bundle ID 就行，scheme 只是用来生成描述文件名，
+    #         没有 project.yml 时用 --profile 或者让 apple-auto 自己推
+    #   secrets 只读 secrets.txt，什么配置都不需要
+    # 之前一律按 doctor 的标准拦，导致空目录里 `setup` 报「缺 scheme」，
+    # 和「setup 不需要 project.yml」的说法自相矛盾。
+    if args.action in ("doctor", "release", "status"):
+        missing = sc.validate(cfg)
+    elif args.action == "setup":
+        missing = [] if cfg.get("bundleId") else ["bundleId"]
+    else:
+        missing = []
+
+    if missing:
+        print(f"\n{C.R}缺关键配置：{', '.join(missing)}{C.X}\n")
+        print("  两种补法：")
+        print("    1. 跑 `ship.py init` 生成 ship.config.json，把值填上")
+        print("    2. 用参数临时给：--bundle-id com.example.myapp")
+        print()
+        print(f"  当前的推断结果：{sc.describe(cfg)}")
+        return 1
+
+    # 回填，后面所有函数直接用
+    args.bundle_id = cfg.get("bundleId") or ""
+    args.profile = cfg.get("profileName") or ""
+    args.cfg = cfg
+    args.feedback_email = (args.feedback_email or cfg.get("feedbackEmail")
+                           or "noreply@example.com")
+
+    # setup / release / status 都要签 JWT（生成 CSR、调 API）。
+    # 缺包时 make_jwt 抛的是 ModuleNotFoundError 加一长串堆栈，
+    # 用户看到的第一行是 "No module named 'cryptography'"，看不出接下来该干什么。
+    if args.action in ("setup", "release", "status") and not check_dep("import cryptography"):
+        print(f"\n{C.R}缺 python 包 cryptography{C.X}\n")
+        print("  跑 `python tools/ship.py deps` 装上。")
+        print("  它负责生成 CSR 和签 ES256 JWT，这三条命令都要用。")
+        return 1
+
     if args.action == "doctor":
         return cmd_doctor(args)
+    if args.action == "rename":
+        return cmd_rename(args)
     if args.action == "setup":
         return cmd_setup(args)
     if args.action == "secrets":
