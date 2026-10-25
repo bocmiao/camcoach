@@ -76,10 +76,18 @@ struct BodyDiagramView: View {
                         selectedID: selectedID) { b in
                 selectedID = (selectedID == b.id) ? nil : b.id
             }
-            Text(currentView.hint)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 4)
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(currentView.hint)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+                Image(systemName: "hand.tap")
+                    .font(.caption2)
+                Text("点键展开")
+                    .font(.caption2)
+            }
+            .foregroundStyle(.tertiary)
+            .padding(.horizontal, 4)
         }
         .padding(12)
         .frame(maxWidth: .infinity)
