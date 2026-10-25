@@ -5,7 +5,7 @@ import SwiftUI
 struct CamCoachApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            RootView()
         }
     }
 }

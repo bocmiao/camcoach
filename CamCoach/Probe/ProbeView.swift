@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
+import ImageCaptureCore
 import SwiftUI
 import UIKit
-import ImageCaptureCore
 
 struct CheckRow: Identifiable {
     let id = UUID()
@@ -10,34 +10,81 @@ struct CheckRow: Identifiable {
     let ok: Bool
 }
 
-struct ContentView: View {
+/// 连相机这一页。
+///
+/// 前面加了一组硬条件检查。这几条任何一条不满足，连上也会秒断，
+/// 而且现象都一样（点开始没反应），不先确认就只能靠猜。
+struct ProbeView: View {
+
+    let data: CameraData
 
     @StateObject private var probe = CameraProbe()
+    @State private var confirmed: Set<String> = []
     @State private var copied = false
 
     var body: some View {
-        NavigationStack {
-            List {
-                deviceSection
-                selfCheckSection
-                logSection
-            }
-            .navigationTitle("取景助手 · 探针")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        UIPasteboard.general.string = probe.reportText
-                        copied = true
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                            copied = false
-                        }
-                    } label: {
-                        Label(copied ? "已复制" : "复制", systemImage: copied ? "checkmark" : "doc.on.doc")
+        List {
+            preflightSection
+            deviceSection
+            selfCheckSection
+            logSection
+        }
+        .listStyle(.insetGrouped)
+        .navigationTitle("连相机")
+        .navigationBarTitleDisplayMode(.large)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    UIPasteboard.general.string = probe.reportText
+                    copied = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        copied = false
                     }
-                    .disabled(probe.logs.isEmpty)
+                } label: {
+                    Label(copied ? "已复制" : "复制",
+                          systemImage: copied ? "checkmark" : "doc.on.doc")
                 }
+                .disabled(probe.logs.isEmpty)
             }
+        }
+    }
+
+    // MARK: - 连接前
+
+    private var preflightSection: some View {
+        Section {
+            ForEach(data.connectChecks) { c in
+                let on = confirmed.contains(c.id)
+                Button {
+                    if on { confirmed.remove(c.id) } else { confirmed.insert(c.id) }
+                } label: {
+                    HStack(alignment: .top, spacing: 12) {
+                        Image(systemName: on ? "checkmark.square.fill" : "square")
+                            .font(.system(size: 18))
+                            .foregroundStyle(on ? Color.accentColor : Color.secondary.opacity(0.5))
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(c.title)
+                                .font(.subheadline)
+                                .foregroundStyle(.primary)
+                            Text(c.detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+        } header: {
+            HStack {
+                Text("连之前先确认")
+                Spacer()
+                Text("\(confirmed.count)/\(data.connectChecks.count)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        } footer: {
+            Text("这 6 条任缺一条，现象都是「点了没反应」，只能靠猜。")
         }
     }
 
@@ -69,15 +116,19 @@ struct ContentView: View {
                     Spacer()
                 }
             }
-            .disabled(probe.running)
+            .disabled(probe.running || !preflightDone)
         } header: {
             Text("相机")
         } footer: {
-            Text("相机用数据线连 iPhone，连接方式选「遥控拍摄」（屏幕显示 -PC-），再点开始。")
+            if preflightDone {
+                Text("相机用数据线连 iPhone，连接方式选「遥控拍摄」（屏幕显示 -PC-），再点开始。")
+            } else {
+                Text("上面还有 \(data.connectChecks.count - confirmed.count) 项没确认。")
+            }
         }
     }
 
-    // MARK: - 自检（v1.0 的内容，保留）
+    // MARK: - 环境自检
 
     private var selfCheckSection: some View {
         Section {
@@ -141,9 +192,15 @@ struct ContentView: View {
             }
         } footer: {
             if !probe.logs.isEmpty {
-                Text("右上角「复制」把整份记录贴给我，就知道下一步该做什么了。")
+                Text("右上角「复制」把整份记录导出来，就知道下一步该做什么了。")
             }
         }
+    }
+
+    // MARK: - 取值
+
+    private var preflightDone: Bool {
+        confirmed.count == data.connectChecks.count
     }
 
     private func color(of level: ProbeLog.Level) -> Color {
