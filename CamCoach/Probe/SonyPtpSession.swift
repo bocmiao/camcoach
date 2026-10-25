@@ -123,7 +123,7 @@ final class SonyPtpSession {
             }
             Thread.sleep(forTimeInterval: 0.1)
         }
-        throw LiveViewError.notReady(last)
+        throw LiveViewError(status: last)
     }
 
     struct LiveViewError: LocalizedError {
