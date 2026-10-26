@@ -17,6 +17,8 @@ final class LiveSession: ObservableObject {
     static let shared = LiveSession()
 
     @Published private(set) var frame: UIImage?
+    /// 没套滤镜的那一帧。长按画面看原图用它，斑马纹和直方图也算在它上面。
+    @Published private(set) var rawFrame: UIImage?
     @Published private(set) var readout = CameraReadout.empty
     /// 当前帧的亮度统计。取景循环在后台线程算好，主线程只负责画。
     @Published private(set) var stats: ExposureStats?
@@ -28,8 +30,10 @@ final class LiveSession: ObservableObject {
     @Published private(set) var lastError: String?
     /// 连续抓不到帧的次数，用来判断是「偶发」还是「真断了」。
     @Published private(set) var missCount = 0
-    /// 刚拍下来的那张。取景循环拍完会把它回传给这里。
+    /// 刚拍下来的那张。
     @Published private(set) var lastShot: UIImage?
+    /// 刚拍下来的原始那一份，没套滤镜。
+    @Published private(set) var lastShotRaw: UIImage?
     /// 快门正在进行中。拍一张要一秒多，期间必须把按钮按住不让再点。
     @Published private(set) var capturing = false
     /// 拍摄出问题时给用户看的一句话，成功就清空。
@@ -55,6 +59,10 @@ final class LiveSession: ObservableObject {
     /// 单条兜底读的轮次。整块里读不到的项不能每轮都去撞一次，
     /// 但又不能只试一次——用户中途拧一下补偿旋钮就变了。
     private var singleReadRound = 0
+    /// 当前滤镜。UI 在主线程改，取景循环在后台队列读，所以用锁保护。
+    private var filterID = "none"
+    private var filterStrength = 0.7
+    private let filterLock = NSLock()
 
     private init() {}
 
@@ -133,6 +141,23 @@ final class LiveSession: ObservableObject {
     /// 很难联想到是权限。手动点一下，因果关系清楚。
     func saveLastShot(_ image: UIImage) {
         UIImageWriteToSavedPhotosAlbum(image, nil, nil, nil)
+    }
+
+    // MARK: - 滤镜
+
+    /// 换滤镜。取景循环下一帧就会用新的。
+    func setFilter(id: String, strength: Double) {
+        filterLock.lock()
+        filterID = id
+        filterStrength = strength
+        filterLock.unlock()
+    }
+
+    /// 取当前滤镜的一份快照。后台队列每帧都读，所以必须走锁。
+    var filterConfig: (id: String, strength: Double) {
+        filterLock.lock()
+        defer { filterLock.unlock() }
+        return (filterID, filterStrength)
     }
 
     // MARK: - 改参数
@@ -227,9 +252,16 @@ final class LiveSession: ObservableObject {
                 // 统计放在这条后台线上算完再一起交给主线程，
                 // 画面、数字、斑马纹三者永远是同一帧，不会出现
                 // 「文字说过曝、画面上没红纹」这种对不上的情况。
+                //
+                // 顺序有讲究：先分析原图，再套滤镜。斑马纹和直方图必须反映
+                // 相机的原始曝光——滤镜是 App 后期，把它算进去等于自己骗自己：
+                // 加个「浓烈」就可能凭空多出一片死白警告。
                 let analysis = Advisor.analyze(image)
+                let cfg = filterConfig
+                let shown = FilterEngine.shared.apply(id: cfg.id, to: image, strength: cfg.strength)
                 DispatchQueue.main.async {
-                    self.frame = image
+                    self.rawFrame = image
+                    self.frame = shown
                     self.stats = analysis?.stats
                     self.zebra = analysis?.zebra
                     self.frameCount += 1
@@ -391,8 +423,12 @@ final class LiveSession: ObservableObject {
             return
         }
         if let jpeg = try? session.pollCapturedJPEG(timeout: 6), let image = UIImage(data: jpeg) {
+            // 存下来的这张要跟取景时看到的一致，否则「所见即所得」就是假的。
+            let cfg = filterConfig
+            let shown = FilterEngine.shared.apply(id: cfg.id, to: image, strength: cfg.strength)
             DispatchQueue.main.async {
-                self.lastShot = image
+                self.lastShotRaw = image
+                self.lastShot = shown
                 self.capturing = false
                 self.captureNote = nil
                 self.shotCount += 1

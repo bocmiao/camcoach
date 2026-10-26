@@ -13,6 +13,11 @@ struct LiveViewScreen: View {
     @StateObject private var live = LiveSession.shared
     /// 镜头焦距。相机不报这一项，而安全快门必须知道它，所以让用户选一次。
     @AppStorage(CameraSettings.focalKey) private var focal = CameraSettings.defaultFocal
+    /// 当前滤镜。和 LiveSession 里那份保持同步，那份给取景循环读。
+    @State private var filterID = "none"
+    @State private var filterStrength = 0.7
+    /// 长按画面时临时看原图。用 GestureState，松手自动弹回，不用自己管状态。
+    @GestureState private var peekOriginal = false
     /// 弹出的那一页。用同一个状态管两种页，避免同一层挂两个 sheet。
     @State private var sheet: SheetKind?
     /// 「存到相册」点完之后的一句确认。
@@ -30,6 +35,7 @@ struct LiveViewScreen: View {
                 if let err = live.lastError {
                     errorRow(err)
                 }
+                filterBar
                 params
                 if let shot = live.lastShot {
                     shotRow(shot)
@@ -69,7 +75,16 @@ struct LiveViewScreen: View {
                 NavigationStack { CalibrationView() }
             }
         }
-        .onAppear { attachIfNeeded() }
+        .onAppear {
+            attachIfNeeded()
+            live.setFilter(id: filterID, strength: filterStrength)
+        }
+        .onChange(of: filterID) { _ in
+            live.setFilter(id: filterID, strength: filterStrength)
+        }
+        .onChange(of: filterStrength) { _ in
+            live.setFilter(id: filterID, strength: filterStrength)
+        }
     }
 
     // MARK: - 画面
@@ -83,7 +98,7 @@ struct LiveViewScreen: View {
                 let w = min(geo.size.width, geo.size.height * ratio)
                 let h = w / ratio
                 ZStack {
-                    if let f = live.frame {
+                    if let f = shownFrame {
                         Image(uiImage: f)
                             .resizable()
                             .scaledToFill()
@@ -114,6 +129,29 @@ struct LiveViewScreen: View {
         }
         .frame(height: 292)
         .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(alignment: .topTrailing) {
+            if peekOriginal {
+                Text("原图")
+                    .font(.system(size: 10, weight: .medium))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Color.black.opacity(0.55))
+                    .foregroundStyle(.white)
+                    .clipShape(Capsule())
+                    .padding(8)
+            }
+        }
+        // 用 simultaneousGesture 而不是 gesture：单独挂长按会把外层
+        // ScrollView 的滚动吃掉，画面就拖不动了。
+        .simultaneousGesture(
+            LongPressGesture(minimumDuration: 0.18)
+                .updating($peekOriginal) { _, state, _ in state = true }
+        )
+    }
+
+    /// 现在该显示哪一帧。长按看原图的那一刻换成没套滤镜的。
+    private var shownFrame: UIImage? {
+        peekOriginal ? live.rawFrame : live.frame
     }
 
     /// 32 档亮度分布。
@@ -180,6 +218,69 @@ struct LiveViewScreen: View {
             .stroke(Color.white.opacity(0.34), lineWidth: 0.8)
         }
         .allowsHitTesting(false)
+    }
+
+    // MARK: - 滤镜
+
+    private var filterBar: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(Filters.all) { f in
+                        filterChip(f)
+                    }
+                }
+                .padding(.horizontal, 2)
+                .padding(.vertical, 1)
+            }
+
+            if filterID != "none" {
+                HStack(spacing: 10) {
+                    Text("强度")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Slider(value: $filterStrength, in: 0...1)
+                    Text("\(Int((filterStrength * 100).rounded()))%")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 34, alignment: .trailing)
+                }
+            }
+
+            Text(filterNote)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func filterChip(_ f: PhotoFilter) -> some View {
+        let on = f.id == filterID
+        return Button {
+            filterID = f.id
+        } label: {
+            Text(f.name)
+                .font(.system(size: 12, weight: on ? .semibold : .regular))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(on ? Color.accentColor.opacity(0.18)
+                              : Color(.secondarySystemGroupedBackground))
+                .foregroundStyle(on ? Color.accentColor : Color.primary)
+                .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// 每个状态都要说清「滤镜改的是什么、不改什么」。
+    ///
+    /// 不说这句，用户会以为拍出来的照片就是这个颜色，
+    /// 打开相机一看不是，会觉得 App 骗人。
+    private var filterNote: String {
+        if filterID == "none" {
+            return "滤镜是 App 内的后期，只改这里的预览和存进相册的那一张，"
+                + "不改相机实际拍出来的照片。长按画面随时看原图。"
+        }
+        return Filters.find(filterID).note + "　长按画面随时看原图。"
     }
 
     // MARK: - 参数
