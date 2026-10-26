@@ -59,10 +59,11 @@ targets:
         #
         # 已用掉：1、2、3（都是 ios.yml 还挂 push 时自动上传的，白占）
         # 4 = 第一个带相机探测功能的包；5–13 = 探测链路一路修到出画面
-        # 当前：14 = 取景页修 tab 折叠 + 机身未给说明 + 快门按钮 + 事件降噪
+        # 14 = 取景页收口（tab 折叠、机身未给说明、快门、事件降噪）
+        # 当前：15 = 高光斑马纹、直方图、按焦距算安全快门、标定采样
         #
         # 发新包前先在这里 +1，再手动触发 ios.yml。
-        CURRENT_PROJECT_VERSION: "14"
+        CURRENT_PROJECT_VERSION: "15"
         # 手动签名：证书和 profile 都由 CI 从 secrets 导入，不让 Xcode 自己去要
         CODE_SIGN_STYLE: Manual
         TARGETED_DEVICE_FAMILY: "1"

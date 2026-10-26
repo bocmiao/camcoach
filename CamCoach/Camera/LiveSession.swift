@@ -18,6 +18,10 @@ final class LiveSession: ObservableObject {
 
     @Published private(set) var frame: UIImage?
     @Published private(set) var readout = CameraReadout.empty
+    /// 当前帧的亮度统计。取景循环在后台线程算好，主线程只负责画。
+    @Published private(set) var stats: ExposureStats?
+    /// 高光溢出的红斜纹叠加图，没有溢出时是 nil。
+    @Published private(set) var zebra: UIImage?
     @Published private(set) var fps: Double = 0
     @Published private(set) var frameCount = 0
     @Published private(set) var running = false
@@ -71,6 +75,8 @@ final class LiveSession: ObservableObject {
         captureNote = nil
         missCount = 0
         frameCount = 0
+        stats = nil
+        zebra = nil
         setStop(false)
         setCaptureRequest(false)
 
@@ -164,8 +170,14 @@ final class LiveSession: ObservableObject {
             if let data = try? session.liveViewFrame(), let image = UIImage(data: data) {
                 gotFrame = true
                 windowFrames += 1
+                // 统计放在这条后台线上算完再一起交给主线程，
+                // 画面、数字、斑马纹三者永远是同一帧，不会出现
+                // 「文字说过曝、画面上没红纹」这种对不上的情况。
+                let analysis = Advisor.analyze(image)
                 DispatchQueue.main.async {
                     self.frame = image
+                    self.stats = analysis?.stats
+                    self.zebra = analysis?.zebra
                     self.frameCount += 1
                 }
             }
@@ -304,6 +316,9 @@ final class LiveSession: ObservableObject {
             self.running = false
             self.fps = 0
             self.capturing = false
+            // 斑马纹是「现在这一帧」的状态，循环停了就不该还挂在画面上，
+            // 否则用户会对着一张静止的帧以为现在还在溢出。
+            self.zebra = nil
         }
     }
 }

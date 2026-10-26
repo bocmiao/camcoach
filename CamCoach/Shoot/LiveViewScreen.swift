@@ -4,19 +4,24 @@ import UIKit
 
 /// 取景页。相机连上之后，这里才是真正用来拍照的界面。
 ///
-/// 左边是相机的实时画面（叠三分线和中心十字），下面是相机里读回来的
-/// 真实参数，再下面是本地算出来的一两句话建议。
+/// 上面是相机的实时画面（叠三分线、中心十字、高光斑马纹、直方图），
+/// 下面是相机里读回来的真实参数，再下面是本地算出来的一两句话建议。
 struct LiveViewScreen: View {
 
     let data: CameraData
 
     @StateObject private var live = LiveSession.shared
-    @State private var stats: ExposureStats?
-    /// 相机自检页。它必须先停掉取景才能跑（同一条 PTP 通道），
-    /// 所以这里用 sheet 而不是 tab：点开就盖住取景，退出就回来，因果关系直观。
-    @State private var showProbe = false
+    /// 镜头焦距。相机不报这一项，而安全快门必须知道它，所以让用户选一次。
+    @AppStorage(CameraSettings.focalKey) private var focal = CameraSettings.defaultFocal
+    /// 弹出的那一页。用同一个状态管两种页，避免同一层挂两个 sheet。
+    @State private var sheet: SheetKind?
     /// 「存到相册」点完之后的一句确认。
     @State private var savedNote: String?
+
+    private enum SheetKind: Identifiable {
+        case probe, calibration
+        var id: Int { self == .probe ? 0 : 1 }
+    }
 
     var body: some View {
         ScrollView {
@@ -42,20 +47,29 @@ struct LiveViewScreen: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
+                    sheet = .calibration
+                } label: {
+                    Label("标定采样", systemImage: "square.and.pencil")
+                }
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
                     live.stop()
-                    showProbe = true
+                    sheet = .probe
                 } label: {
                     Label("相机自检", systemImage: "wrench.and.screwdriver")
                 }
             }
         }
-        .sheet(isPresented: $showProbe) {
-            NavigationStack {
-                ProbeView(data: data)
+        .sheet(item: $sheet) { kind in
+            switch kind {
+            case .probe:
+                NavigationStack { ProbeView(data: data) }
+            case .calibration:
+                NavigationStack { CalibrationView() }
             }
         }
         .onAppear { attachIfNeeded() }
-        .onChange(of: live.frameCount) { _ in refreshStats() }
     }
 
     // MARK: - 画面
@@ -76,7 +90,22 @@ struct LiveViewScreen: View {
                     } else {
                         emptyHint
                     }
+                    // 斑马纹压在画面上、三分线下面：它是「这一片已经没细节了」的
+                    // 警告，不该盖住构图用的辅助线。
+                    if let z = live.zebra {
+                        Image(uiImage: z)
+                            .resizable()
+                            .interpolation(.none)
+                            .opacity(0.75)
+                            .allowsHitTesting(false)
+                    }
                     gridOverlay
+                    if let s = live.stats {
+                        histogram(s)
+                            .frame(width: 128, height: 40)
+                            .padding(8)
+                            .frame(width: w, height: h, alignment: .bottomLeading)
+                    }
                 }
                 .frame(width: w, height: h)
                 .clipped()
@@ -85,6 +114,31 @@ struct LiveViewScreen: View {
         }
         .frame(height: 292)
         .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    /// 32 档亮度分布。
+    ///
+    /// 画成柱状而不是曲线：新手看的是「有没有堆在最左或最右」，
+    /// 柱子贴不贴边比曲线好不好看重要。
+    private func histogram(_ stats: ExposureStats) -> some View {
+        Canvas { ctx, size in
+            let bins = stats.histogram
+            guard !bins.isEmpty else { return }
+            let peak = max(bins.max() ?? 0, 0.0001)
+            let bw = size.width / CGFloat(bins.count)
+            var path = Path()
+            for (i, v) in bins.enumerated() {
+                let bh = size.height * CGFloat(v / peak)
+                guard bh > 0.5 else { continue }
+                let x = CGFloat(i) * bw
+                path.addRect(CGRect(x: x, y: size.height - bh,
+                                    width: max(bw - 1, 1), height: bh))
+            }
+            ctx.fill(path, with: .color(.white.opacity(0.82)))
+        }
+        .background(Color.black.opacity(0.38))
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .allowsHitTesting(false)
     }
 
     private var emptyHint: some View {
@@ -157,6 +211,7 @@ struct LiveViewScreen: View {
         VStack(spacing: 8) {
             paramBar
             statusBar
+            focalRow
             if !live.readout.missingFields.isEmpty && live.running {
                 missingNote
             }
@@ -164,6 +219,47 @@ struct LiveViewScreen: View {
                 errorRow(note)
             }
         }
+    }
+
+    /// 焦距选择。
+    ///
+    /// 相机不通过 PTP 报当前焦距，而「手持安全快门」必须知道它——
+    /// 写死 1/50 的话，24mm 端太保守、85mm 端太乐观。
+    private var focalRow: some View {
+        HStack(spacing: 8) {
+            Text("镜头焦距")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Menu {
+                ForEach(CameraSettings.focalChoices, id: \.self) { f in
+                    Button {
+                        focal = f
+                    } label: {
+                        if f == focal {
+                            Label("\(f)mm", systemImage: "checkmark")
+                        } else {
+                            Text("\(f)mm")
+                        }
+                    }
+                }
+            } label: {
+                Text("\(focal)mm")
+                    .font(.system(size: 12, weight: .medium, design: .rounded))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Color(.secondarySystemGroupedBackground))
+                    .clipShape(Capsule())
+            }
+            Text("手持安全快门按 \(safeShutterText) 算")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var safeShutterText: String {
+        "1/\(focal)"
     }
 
     private func chip(_ label: String, _ value: String) -> some View {
@@ -237,7 +333,7 @@ struct LiveViewScreen: View {
             return [Advice(level: .good, text: "还没开始取景",
                            detail: "连上相机后点「开始取景」，参数和建议会跟着画面实时更新。")]
         }
-        return Advisor.review(live.readout, exposure: stats)
+        return Advisor.review(live.readout, exposure: live.stats, focalMM: focal)
     }
 
     private func color(of level: Advice.Level) -> Color {
@@ -398,11 +494,5 @@ struct LiveViewScreen: View {
         if let cam = CameraProbe.shared.device {
             live.attach(cam)
         }
-    }
-
-    /// 每 4 帧算一次曝光统计。每帧都算没必要，64×64 也会占主线程时间。
-    private func refreshStats() {
-        guard live.frameCount > 0, live.frameCount % 4 == 0, let f = live.frame else { return }
-        stats = Advisor.exposure(f)
     }
 }
