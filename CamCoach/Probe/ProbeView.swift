@@ -242,7 +242,7 @@ struct ProbeView: View {
             }
         } footer: {
             if !probe.logs.isEmpty {
-                Text("右上角「复制」把整份记录导出来，就知道下一步该做什么了。")
+                Text("日志会保留多轮，不清空。连点两次再复制，两次的差异会一起带走。")
             }
         }
     }
