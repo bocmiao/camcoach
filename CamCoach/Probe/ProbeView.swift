@@ -11,7 +11,7 @@ struct ProbeView: View {
 
     let data: CameraData
 
-    @StateObject private var probe = CameraProbe()
+    @StateObject private var probe = CameraProbe.shared
     @State private var confirmed: Set<String> = []
     @State private var copied = false
 

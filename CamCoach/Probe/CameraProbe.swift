@@ -37,6 +37,9 @@ struct ProbeLog: Identifiable {
 /// 写属性、拉取景这类会改动相机状态的操作单独做成按钮，默认不执行。
 final class CameraProbe: NSObject, ObservableObject {
 
+    /// 全 App 一个。取景页要拿这里连上的那台相机，不能各自枚举各的。
+    static let shared = CameraProbe()
+
     @Published private(set) var logs: [ProbeLog] = []
     @Published private(set) var running = false
     @Published private(set) var phase = "未开始"
@@ -77,8 +80,14 @@ final class CameraProbe: NSObject, ObservableObject {
 
     // MARK: - 对外接口
 
+    /// 已经握在手里的相机。取景页靠它拿设备，不再自己枚举一遍。
+    var device: ICCameraDevice? { camera }
+
     func begin() {
         guard !running else { return }
+        // 取景循环和探针共用同一条 PTP 通道，事务号各算各的，
+        // 两个同时跑会互相打乱。探针要跑，先让取景停下。
+        LiveSession.shared.stop()
         attempts += 1
         let n = attempts
         main {

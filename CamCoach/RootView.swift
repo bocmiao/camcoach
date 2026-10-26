@@ -22,6 +22,13 @@ struct MainTabs: View {
     var body: some View {
         TabView {
             NavigationStack {
+                LiveViewScreen()
+            }
+            .tabItem {
+                Label("取景", systemImage: "camera.viewfinder")
+            }
+
+            NavigationStack {
                 BodyDiagramView(data: data)
             }
             .tabItem {
