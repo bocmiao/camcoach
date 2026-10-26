@@ -365,6 +365,10 @@ final class CameraProbe: NSObject, ObservableObject {
     private func probeLink(on cam: ICCameraDevice) {
         let session = SonyPtpSession(camera: cam)
 
+        // 不管从哪条路退出，都把索尼那边的连接断干净。
+        // 停在半路会让相机一直算「已连接」，下一轮从零开始都连不上。
+        defer { session.disconnect() }
+
         // ---- 1. 命令通道。GetDeviceInfo 不需要索尼认证，是整条链上最干净的一级：
         // 能读出来就同时证明「USB 枚举通了、会话通了、命令通道通了」。
         main { self.phase = "读设备信息" }

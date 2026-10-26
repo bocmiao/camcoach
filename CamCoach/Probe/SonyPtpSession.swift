@@ -118,6 +118,15 @@ final class SonyPtpSession {
         return protocolVersion
     }
 
+    /// 收尾：把索尼的 SDIO 连接断掉（0x9201 的第三阶段）。
+    ///
+    /// 不发这一下，相机会一直停在「已连接」状态。下次再连时，
+    /// 认证第一步就可能被拒，或者整台相机在系统侧被算作占用。
+    /// 所有失败路径都要走到这里，所以调用方把它放进 defer。
+    func disconnect() {
+        _ = try? send(PTP.sonyConnect, params: [3, 0, 0], expectsData: true)
+    }
+
     // MARK: - 属性
 
     /// 读回全部属性。轮询 D221/D215/D213 时也走这条。
