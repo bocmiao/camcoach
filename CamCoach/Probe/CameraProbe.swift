@@ -52,12 +52,20 @@ final class CameraProbe: NSObject, ObservableObject {
     @Published private(set) var enumeratedCount = 0
     /// didAdd 回调次数。它大于 0 而 enumeratedCount 是 0，说明设备进来又被判定为非相机。
     @Published private(set) var addCount = 0
+    /// 手里是否握着可用的相机对象。第二轮直接用它，不再重新枚举。
+    @Published private(set) var hasCamera = false
     /// 每次 didAdd 的原始描述，原样留着，不加工。
     @Published private(set) var rawDevices: [String] = []
 
-    /// 每次扫描换一个新的浏览器实例，这里不能是 let。
-    /// 复用同一个实例做 stop()→start()，第二次往往一台设备都枚举不到。
+    /// 整个 App 生命周期只用一个浏览器，不为每轮扫描重建。
+    ///
+    /// `didAdd` 对同一台设备在一次进程里只报一次：`stop()` → `start()`
+    /// 不会重报，新建实例也拿不到。所以反复重建浏览器去「重新发现」是死路，
+    /// 只会看到「枚举到 0 台，didAdd 回调 0 次」。
+    /// 真正要复用的是 `camera` 这个引用，不是浏览器。
     private var browser = ICDeviceBrowser()
+    /// 浏览器起过没有。起过就一直让它跑着，设备插拔它会自己报。
+    private var browserStarted = false
     private var camera: ICCameraDevice?
     /// 探测次数。日志不再每次清空，靠这个编号把多轮记录分开。
     private var attempts = 0
@@ -75,10 +83,10 @@ final class CameraProbe: NSObject, ObservableObject {
         let n = attempts
         main {
             self.running = true
-            self.phase = "申请授权"
-            self.deviceLabel = "搜索中…"
+            self.phase = "准备"
+            // 保住上一轮拿到的相机。第二轮不该再等一次 didAdd。
+            self.deviceLabel = self.camera.map { $0.name ?? "相机" } ?? "搜索中…"
             self.previewFrame = nil
-            self.camera = nil
             self.addCount = 0
             self.enumeratedCount = 0
             self.rawDevices.removeAll()
@@ -88,6 +96,14 @@ final class CameraProbe: NSObject, ObservableObject {
         Task { await self.scan() }
     }
 
+    /// 手动清场：关会话、丢掉设备引用、换一个新浏览器重新发现。
+    ///
+    /// 只在设备被卡住（相机不再应答、换了根线重插也不回来）时用。
+    func reset() {
+        guard !running else { return }
+        Task { await hardReset() }
+    }
+
     // MARK: - 找到设备
 
     /// 从授权一路走到找到设备，每一级都留证据。
@@ -95,36 +111,31 @@ final class CameraProbe: NSObject, ObservableObject {
     /// 顺序不能换。没授权时系统会静默不枚举，后面看到的全是假失败，
     /// 排查时就会一路往协议层找，方向从一开始就是错的。
     private func scan() async {
-        // 换一个新的浏览器实例再扫。
+        // 手里还有相机就直接复用，不再走发现流程。
         //
-        // 上一版是复用同一个实例 stop()→start()，结果第一次能连、第二次一台都枚举不到：
-        // 同一个 ICDeviceBrowser 重启浏览时，不会把「已经报过」的设备重新报一遍
-        // didAdd，devices 也可能被清空。加上第一次开过 PTP 会话没关，
-        // 相机在系统侧仍算「被占用」，就彻底看不见了。
-        await replaceBrowser()
+        // 这是「第一次能连、第二次找不到」的正解：设备没掉线，
+        // 只是 didAdd 不会对同一台设备报第二次。上一版在 begin() 里
+        // 把 camera 置空，等于主动把它丢了，然后再去等一个永远不来的回调。
+        if let cam = camera {
+            log(.ok, "复用上一轮连上的相机", detail: "\(cam.name ?? "未命名")　"
+                + "会话已开：\(cam.hasOpenSession ? "是" : "否")")
+            await runProbe(on: cam)
+            return
+        }
 
         await requestAuthorizations()
 
-        // 启停必须回主线程。ICDeviceBrowser 靠发起线程的 runloop 派发回调，
-        // 在没有 runloop 的后台线程上调 start()，didAdd 永远不会来——
-        // 现象和「没插相机」一模一样。
-        await MainActor.run {
-            self.phase = "搜索设备"
-            // iOS 15.2 起才有的属性，默认值不一定含本地 USB。
-            // 显式指定「相机 + 本地连接」——少这一句，可能一台设备都枚举不到。
-            // init(rawValue:) 是可失败的（组合位不一定落在合法取值里），退回 .camera。
-            let mask = ICDeviceTypeMask(
-                rawValue: ICDeviceTypeMask.camera.rawValue
-                    | ICDeviceLocationTypeMask.local.rawValue) ?? .camera
-            self.browser.browsedDeviceTypeMask = mask
-            self.browseMask = "相机 + 本地连接"
-            self.browser.start()
+        if !browserStarted {
+            await startBrowsing()
+        } else {
+            log(.info, "浏览器一直在跑，等设备出现")
         }
-        log(.info, "浏览器已启动", detail: "isBrowsing = \(browser.isBrowsing)\n过滤条件：相机 + 本地连接")
 
-        // 设备有可能已经在浏览器里、但 didAdd 不会再报一次，先直接捡现成的。
+        // 设备有可能已经在浏览器里、但 didAdd 不会重报，先捡现成的。
         if let known = liveDevices().first {
-            adopt(known, source: "启动时已在浏览器的设备列表里")
+            adopt(known, source: "浏览器现有的设备列表")
+            await runProbe(on: known)
+            return
         }
 
         // 20 秒。相机切到遥控模式会重连一次 USB，插上就点开始的话前几秒是空的。
@@ -141,11 +152,9 @@ final class CameraProbe: NSObject, ObservableObject {
                 lastCount = count
                 log(.info, "系统枚举到 \(count) 台设备")
             }
-            if camera == nil, let known = liveDevices().first {
+            if let known = liveDevices().first {
                 adopt(known, source: "扫描过程中出现在设备列表里")
-            }
-            if let cam = camera {
-                await runProbe(on: cam)
+                await runProbe(on: known)
                 return
             }
         }
@@ -153,15 +162,51 @@ final class CameraProbe: NSObject, ObservableObject {
         finish("没有设备")
     }
 
-    /// 丢掉旧浏览器，换一个新的。给系统相机守护进程一点时间释放上一轮的占用。
-    private func replaceBrowser() async {
+    /// 启停必须回主线程。ICDeviceBrowser 靠发起线程的 runloop 派发回调，
+    /// 在没有 runloop 的后台线程上调 start()，didAdd 永远不会来。
+    private func startBrowsing() async {
+        await MainActor.run {
+            self.phase = "搜索设备"
+            // iOS 15.2 起才有的属性，默认值不一定含本地 USB。
+            // 显式指定「相机 + 本地连接」——少这一句，可能一台设备都枚举不到。
+            // init(rawValue:) 是可失败的（组合位不一定落在合法取值里），退回 .camera。
+            let mask = ICDeviceTypeMask(
+                rawValue: ICDeviceTypeMask.camera.rawValue
+                    | ICDeviceLocationTypeMask.local.rawValue) ?? .camera
+            self.browser.browsedDeviceTypeMask = mask
+            self.browseMask = "相机 + 本地连接"
+            self.browser.start()
+            self.browserStarted = true
+        }
+        log(.info, "浏览器已启动", detail: "isBrowsing = \(browser.isBrowsing)\n过滤条件：相机 + 本地连接")
+    }
+
+    /// 兜底清场。只有在设备被卡死（换线重插也回不来）时才需要。
+    private func hardReset() async {
+        let old = camera
+        camera = nil
+        main {
+            self.deviceLabel = "未发现设备"
+            self.enumeratedCount = 0
+            self.browsingNow = false
+            self.hasCamera = false
+        }
+
         browser.delegate = nil
         browser.stop()
-        try? await Task.sleep(nanoseconds: 400_000_000)
+        browserStarted = false
+        if let old, old.hasOpenSession {
+            try? await old.requestCloseSession()
+        }
+        try? await Task.sleep(nanoseconds: 600_000_000)
 
+        // 这条路上必须换新实例：同一个浏览器重启浏览不会重报设备。
         let fresh = ICDeviceBrowser()
         fresh.delegate = self
         browser = fresh
+        main { self.browseMask = "未设置" }
+        log(.warn, "已清场", detail: "会话已关、设备引用已丢、浏览器换新。"
+            + "下一轮会从零重新发现，相机会被系统当成刚插上。")
     }
 
     private func liveDevices() -> [ICCameraDevice] {
@@ -172,7 +217,10 @@ final class CameraProbe: NSObject, ObservableObject {
         guard camera !== cam else { return }
         cam.delegate = self
         camera = cam
-        main { self.deviceLabel = cam.name ?? "相机" }
+        main {
+            self.deviceLabel = cam.name ?? "相机"
+            self.hasCamera = true
+        }
         log(.ok, "已接管相机", detail: "来源：\(source)\n名称：\(cam.name ?? "未报告")\n"
             + "能力：\(cam.capabilities.isEmpty ? "未报告" : cam.capabilities.joined(separator: " "))")
     }
@@ -293,7 +341,7 @@ final class CameraProbe: NSObject, ObservableObject {
         out += "内容授权：\(contentsAuth)    控制授权：\(controlAuth)\n"
         out += "过滤条件：\(browseMask)    浏览器在跑：\(browsingNow ? "是" : "否")\n"
         out += "枚举到的设备：\(enumeratedCount)    didAdd 回调：\(addCount)\n"
-        out += "当前相机：\(deviceLabel)\n"
+        out += "持有相机对象：\(hasCamera ? "是" : "否")    当前相机：\(deviceLabel)\n"
         for d in rawDevices {
             out += "  · \(d)\n"
         }
@@ -326,16 +374,19 @@ final class CameraProbe: NSObject, ObservableObject {
     /// 所以它不逐条试命令，而是把整条取景链路一次走到底，
     /// 每一步的返回码都记下来。哪一步断了，报告里直接看得出来。
     private func runProbe(on cam: ICCameraDevice) async {
-        log(.ok, "发现相机：\(cam.name ?? "未命名")", detail: description(of: cam))
+        log(.ok, "使用相机：\(cam.name ?? "未命名")", detail: description(of: cam))
 
-        main { self.phase = "打开会话" }
-        do {
-            try await cam.requestOpenSession()
-        } catch {
-            log(.warn, "打开会话报错，继续试命令", detail: error.localizedDescription
-                + "\n有时会话已经开了，只是系统报了个警告")
+        // 会话按需打开。上一轮结束时已经关掉了，这里重新开一个。
+        if !cam.hasOpenSession {
+            main { self.phase = "打开会话" }
+            do {
+                try await cam.requestOpenSession()
+            } catch {
+                log(.warn, "打开会话报错，继续试命令", detail: error.localizedDescription
+                    + "\n有时会话已经开了，只是系统报了个警告")
+            }
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
         }
-        try? await Task.sleep(nanoseconds: 1_200_000_000)
 
         // PTP 发包要阻塞等回调，得挪到专门的后台队列，
         // 别占 Swift 并发的线程池，也别碰主线程。
@@ -346,20 +397,12 @@ final class CameraProbe: NSObject, ObservableObject {
             }
         }
 
-        // 会话必须关掉。
+        // 会话不关，留给下一轮。
         //
-        // 不关的话，相机在系统侧一直算「已被本机占用」：下一轮扫描时
-        // ICDeviceBrowser 不会把这个设备重新报出来，devices 也是空的。
-        // 现象就是第一次能连、第二次一台都找不到。
-        if cam.hasOpenSession {
-            do {
-                try await cam.requestCloseSession()
-                log(.info, "已关闭相机会话")
-            } catch {
-                log(.warn, "关闭会话失败", detail: error.localizedDescription
-                    + "\n下一轮可能枚举不到相机，重启 App 可以清掉")
-            }
-        }
+        // 关掉再开是「多一个未知数」：重新打开会不会成功没有实测依据，
+        // 而 keep-alive 就是联机拍摄 App 的常规做法。会话要是真的失效了，
+        // 下一次 GetDeviceInfo 会立刻报错，用「断开并重新发现」清场即可。
+        log(.info, "会话保持", detail: "下一轮直接用这个会话，不重连、不重新枚举")
     }
 
     private func probeLink(on cam: ICCameraDevice) {
@@ -377,11 +420,10 @@ final class CameraProbe: NSObject, ObservableObject {
             if let raw, let info = SonyDeviceInfo.parse(raw) {
                 log(.ok, "命令通道通了，相机在应答", detail: """
                 厂商扩展：\(info.vendorLabel)
-                厂商：\(info.manufacturer.isEmpty ? "未提供" : info.manufacturer)
-                型号：\(info.modelLabel)
-                固件：\(info.deviceVersion.isEmpty ? "未提供" : info.deviceVersion)
                 标准版本：0x\(String(format: "%04X", info.standardVersion))
-                操作 \(info.operationCount) 条，属性 \(info.propertyCount) 条
+                操作 \(info.operationCount) 条、属性 \(info.propertyCount) 条
+                厂商／型号／固件：\(modelText(info))
+                机型以系统报的「\(cam.name ?? "未命名")」为准
                 """)
                 if !info.isSony {
                     log(.warn, "厂商扩展不是索尼",
@@ -504,6 +546,15 @@ final class CameraProbe: NSObject, ObservableObject {
 
     // MARK: - 小工具
 
+    /// PC 遥控模式下的 DeviceInfo 是精简版，厂商／型号／固件常常留空。
+    /// 这不算解析失败，写清楚免得被当成读坏了。
+    private func modelText(_ info: SonyDeviceInfo) -> String {
+        let parts = [info.manufacturer, info.model, info.deviceVersion]
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        return parts.isEmpty ? "相机没填（精简版 DeviceInfo，正常）" : parts.joined(separator: " / ")
+    }
+
     private func description(of cam: ICCameraDevice) -> String {
         // 只用确定存在的属性。productKind / transportType / isAccessRestricted
         // 这几个在 iOS 上不一定有（有些是 macOS 专属），写上去反而编不过。
@@ -563,7 +614,10 @@ extension CameraProbe: ICDeviceBrowserDelegate {
     func deviceBrowser(_ browser: ICDeviceBrowser, didRemove device: ICDevice, moreGoing: Bool) {
         guard let cam = device as? ICCameraDevice, cam == camera else { return }
         camera = nil
-        main { self.deviceLabel = "设备已断开" }
+        main {
+            self.deviceLabel = "设备已断开"
+            self.hasCamera = false
+        }
         // 第二次枚举不到的原因常常就在这里：设备其实是被系统摘掉了。
         log(.warn, "相机从系统里消失了", detail: "\(cam.name ?? "未命名") 被移除，"
             + "下一轮扫描要从零重新发现它")
@@ -580,7 +634,10 @@ extension CameraProbe: ICCameraDeviceDelegate {
     func didRemove(_ device: ICDevice) {
         guard let cam = device as? ICCameraDevice, cam == camera else { return }
         camera = nil
-        main { self.deviceLabel = "设备已移除" }
+        main {
+            self.deviceLabel = "设备已移除"
+            self.hasCamera = false
+        }
     }
 
     func device(_ device: ICDevice, didOpenSessionWithError error: Error?) {

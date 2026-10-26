@@ -113,6 +113,21 @@ struct ProbeView: View {
                 }
             }
             .disabled(probe.running || !preflightDone)
+
+            // 兜底。只在设备卡死（换线重插也回不来）时用：
+            // 丢了引用再换一个新浏览器，等于让系统把它当成刚插上。
+            Button {
+                probe.reset()
+            } label: {
+                HStack {
+                    Spacer()
+                    Text("断开并重新发现")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+            }
+            .disabled(probe.running)
         } header: {
             Text("相机")
         } footer: {
@@ -161,10 +176,12 @@ struct ProbeView: View {
                         ? "NSCameraUsageDescription 已声明"
                         : "缺 NSCameraUsageDescription，系统会静默不枚举",
                       cameraUsageDeclared ? LadderState.pass : .fail)
-            ladderRow(3, "设备枚举",
-                      "浏览器\(probe.browsingNow ? "在跑" : "没在跑")，"
-                        + "枚举到 \(probe.enumeratedCount) 台，didAdd 回调 \(probe.addCount) 次",
-                      enumerateState)
+            ladderRow(3, "设备",
+                      probe.hasCamera
+                        ? "已持有相机，本轮直接复用，不再重新枚举"
+                        : "浏览器\(probe.browsingNow ? "在跑" : "没在跑")，"
+                            + "枚举到 \(probe.enumeratedCount) 台，didAdd 回调 \(probe.addCount) 次",
+                      probe.hasCamera ? LadderState.pass : enumerateState)
             ladderRow(4, "过滤条件", probe.browseMask,
                       probe.browseMask == "未设置" ? .unknown : .pass)
             ladderRow(5, "环境",
