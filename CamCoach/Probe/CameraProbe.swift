@@ -96,9 +96,11 @@ final class CameraProbe: NSObject, ObservableObject {
             self.phase = "搜索设备"
             // iOS 15.2 起才有的属性，默认值不一定含本地 USB。
             // 显式指定「相机 + 本地连接」——少这一句，可能一台设备都枚举不到。
-            self.browser.browsedDeviceTypeMask = ICDeviceTypeMask(
+            // init(rawValue:) 是可失败的（组合位不一定落在合法取值里），退回 .camera。
+            let mask = ICDeviceTypeMask(
                 rawValue: ICDeviceTypeMask.camera.rawValue
-                    | ICDeviceLocationTypeMask.local.rawValue)
+                    | ICDeviceLocationTypeMask.local.rawValue) ?? .camera
+            self.browser.browsedDeviceTypeMask = mask
             self.browseMask = "相机 + 本地连接"
             self.browser.stop()
             self.browser.start()
@@ -165,21 +167,18 @@ final class CameraProbe: NSObject, ObservableObject {
         }
     }
 
-    /// `ICAuthorizationStatus` 的取值和 `AVAuthorizationStatus` 一致：
-    /// 0 未询问 / 1 受限 / 2 拒绝 / 3 已授权。
-    /// 按 rawValue 判断而不是写 case 名，少一层编译期依赖。
+    /// `ICAuthorizationStatus` 是字符串枚举（不是整数），所以按成员比较，
+    /// 不去猜 rawValue 的实际字面值。
     static func authLabel(_ status: ICAuthorizationStatus) -> String {
-        switch status.rawValue {
-        case 0: return "还没问过"
-        case 1: return "受系统限制"
-        case 2: return "已拒绝"
-        case 3: return "已授权"
-        default: return "未识别(\(status.rawValue))"
-        }
+        if status == .authorized { return "已授权" }
+        if status == .denied { return "已拒绝" }
+        if status == .restricted { return "受系统限制" }
+        if status == .notDetermined { return "还没问过" }
+        return "未知(\(status.rawValue))"
     }
 
     static func isAuthorized(_ status: ICAuthorizationStatus) -> Bool {
-        status.rawValue == 3
+        status == .authorized
     }
 
     /// 找不设备时的分层结论。
