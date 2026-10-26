@@ -218,7 +218,100 @@ struct LiveViewScreen: View {
             if let note = live.captureNote {
                 errorRow(note)
             }
+            writeControls
+            if let note = live.writeNote {
+                writeNoteRow(note)
+            }
         }
+    }
+
+    // MARK: - 改参数
+
+    /// ISO 和曝光补偿的加减。
+    ///
+    /// 只放这两项：它们写错也只是变了档位，不像模式、画质那样要进菜单才能救。
+    /// 每一下都是「写下去 → 等回读 → 显示相机实际的值」，回读没对上就直说。
+    private var writeControls: some View {
+        let canWrite = live.running && !live.writing && !live.capturing
+        return VStack(spacing: 6) {
+            writeRow("ISO",
+                     live.readout.iso,
+                     minus: { live.setISO(WritableParam.isoDown(from: live.readout.isoValue)) },
+                     plus: { live.setISO(WritableParam.isoUp(from: live.readout.isoValue)) },
+                     enabled: canWrite)
+
+            if live.readout.exposureCompMilli != nil {
+                writeRow("补偿",
+                         live.readout.exposureComp,
+                         minus: { shiftEV(-1) },
+                         plus: { shiftEV(1) },
+                         enabled: canWrite)
+            } else {
+                HStack(spacing: 8) {
+                    Text("补偿")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 34, alignment: .leading)
+                    Text("机身没报这一项，App 改不了")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+    }
+
+    private func shiftEV(_ direction: Int) {
+        guard let cur = live.readout.exposureCompMilli else { return }
+        live.setExposureComp(milliEV: WritableParam.evShift(cur, direction: direction))
+    }
+
+    private func writeRow(_ label: String, _ value: String,
+                          minus: @escaping () -> Void,
+                          plus: @escaping () -> Void,
+                          enabled: Bool) -> some View {
+        HStack(spacing: 8) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 34, alignment: .leading)
+            Text(value)
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .frame(maxWidth: .infinity, alignment: .leading)
+            stepButton("minus", action: minus, enabled: enabled)
+            stepButton("plus", action: plus, enabled: enabled)
+        }
+    }
+
+    private func stepButton(_ symbol: String,
+                            action: @escaping () -> Void,
+                            enabled: Bool) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 11, weight: .semibold))
+                .frame(width: 38, height: 30)
+                .background(Color(.secondarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.35)
+    }
+
+    private func writeNoteRow(_ text: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.system(size: 12))
+                .foregroundStyle(Color.accentColor)
+                .padding(.top, 2)
+            Text(text)
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .background(Color.accentColor.opacity(0.10))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 
     /// 焦距选择。

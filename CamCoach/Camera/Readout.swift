@@ -21,6 +21,9 @@ struct CameraReadout: Equatable {
     var shutterSeconds: Double?
     /// ISO 数值，用来判断噪点风险。
     var isoValue: Double?
+    /// 曝光补偿的数值（单位 1/1000 EV）。调补偿的加减按钮要拿它当基准，
+    /// 不能拿显示字符串反解——「+0.3」是格式化过的，反解会丢精度。
+    var exposureCompMilli: Int?
     /// 这轮读回多少条属性。0 说明整块没读到。
     var propertyCount = 0
     /// 这台机身没通过 PTP 报出来的项（显示名）。
@@ -58,6 +61,39 @@ enum CameraProp {
     static let exposureTimeStd: UInt16 = 0x500D
 }
 
+/// 可以写的两档参数，以及它们的步进。
+///
+/// 只列 ISO 和曝光补偿。这两条即使写错也只是变了档位，
+/// 不像模式、画质、格式化那样要进菜单才能救回来。
+enum WritableParam {
+
+    /// A7M4 静止影像的整档 ISO。
+    static let isoSteps: [Int] = [50, 100, 200, 400, 800, 1600, 3200,
+                                  6400, 12800, 25600, 51200, 102400]
+
+    /// 曝光补偿一步。索尼按 1/1000 EV 编码，1/3 档就是 333。
+    static let evStepMilli = 333
+    /// 补偿的上下限，±5 EV。
+    static let evMaxMilli = 5000
+
+    /// 当前 ISO 的上一档。读不到当前值时给一个中间档，别一上来就跳极端。
+    static func isoUp(from current: Double?) -> Int {
+        guard let c = current else { return 400 }
+        return isoSteps.first { Double($0) > c } ?? isoSteps[isoSteps.count - 1]
+    }
+
+    static func isoDown(from current: Double?) -> Int {
+        guard let c = current else { return 400 }
+        return isoSteps.last { Double($0) < c } ?? isoSteps[0]
+    }
+
+    /// 把当前的 milliEV 往上/往下挪一步，夹在 ±5 EV 内。
+    static func evShift(_ milliEV: Int, direction: Int) -> Int {
+        let next = milliEV + direction * evStepMilli
+        return min(max(next, -evMaxMilli), evMaxMilli)
+    }
+}
+
 // MARK: - 解码
 
 extension CameraReadout {
@@ -93,8 +129,10 @@ extension CameraReadout {
 
         if let v = SonySDIO.scalar(props, CameraProp.exposureComp) {
             r.exposureComp = Self.evText(v)
+            r.exposureCompMilli = Int(v)
         } else if let v = SonySDIO.scalar(props, CameraProp.exposureCompStd) {
             r.exposureComp = Self.evText(v)
+            r.exposureCompMilli = Int(v)
         } else {
             r.missingFields.append("补偿")
         }

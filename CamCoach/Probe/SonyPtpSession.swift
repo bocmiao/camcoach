@@ -150,6 +150,29 @@ final class SonyPtpSession {
         return r.data
     }
 
+    // MARK: - 写属性
+
+    /// 写一条 4 字节的 SDIO 属性。
+    ///
+    /// `0x9205` 的参数是属性码，负载就是值本身（小端），没有别的包装。
+    /// 相机收下会回 `0x2001`，**但回 0x2001 只代表命令收下了，不代表值生效**——
+    /// 是否真的改成目标值，必须再读一遍比对。这个区别是写参数最容易出错的地方：
+    /// 以为成功了，其实相机把值夹到了别的档位。
+    func writeSDIOUInt32(_ code: UInt16, _ value: UInt32) throws {
+        var le = value.littleEndian
+        let payload = withUnsafeBytes(of: &le) { Data($0) }
+        _ = try send(PTP.setSDIOPropValue, params: [UInt32(code)],
+                     outgoing: payload, expectsData: false)
+    }
+
+    /// 写一条 2 字节的有符号 SDIO 属性（曝光补偿是这条）。
+    func writeSDIOInt16(_ code: UInt16, _ value: Int16) throws {
+        var le = value.littleEndian
+        let payload = withUnsafeBytes(of: &le) { Data($0) }
+        _ = try send(PTP.setSDIOPropValue, params: [UInt32(code)],
+                     outgoing: payload, expectsData: false)
+    }
+
     // MARK: - 实时取景
 
     /// 等取景就绪。D221 非 0 表示相机已经把取景对象挂出来了。

@@ -35,12 +35,23 @@ final class LiveSession: ObservableObject {
     /// 拍摄出问题时给用户看的一句话，成功就清空。
     @Published private(set) var captureNote: String?
     @Published private(set) var shotCount = 0
+    /// 改参数的反馈。写下去之后回读没对上，也在这里说清楚。
+    @Published private(set) var writeNote: String?
+    /// 正在写参数。写完之前把按钮压住，不然连点会排队撞车。
+    @Published private(set) var writing = false
+
+    /// 一次写请求。只做这两种，别的一律不碰。
+    private enum WriteRequest {
+        case iso(UInt32)
+        case exposureComp(Int16)
+    }
 
     private var camera: ICCameraDevice?
     private let queue = DispatchQueue(label: "camcoach.liveview", qos: .userInitiated)
     private let gate = NSLock()
     private var stopRequested = false
     private var captureRequested = false
+    private var pendingWrite: WriteRequest?
     /// 单条兜底读的轮次。整块里读不到的项不能每轮都去撞一次，
     /// 但又不能只试一次——用户中途拧一下补偿旋钮就变了。
     private var singleReadRound = 0
@@ -99,6 +110,8 @@ final class LiveSession: ObservableObject {
         setStop(true)
         running = false
         capturing = false
+        // 停下时把没做完的写请求也丢掉，否则按钮会一直停在「写不动」的样子。
+        writing = false
     }
 
     /// 按一下快门。
@@ -120,6 +133,41 @@ final class LiveSession: ObservableObject {
     /// 很难联想到是权限。手动点一下，因果关系清楚。
     func saveLastShot(_ image: UIImage) {
         UIImageWriteToSavedPhotosAlbum(image, nil, nil, nil)
+    }
+
+    // MARK: - 改参数
+
+    /// 把 ISO 设成指定值。
+    ///
+    /// 和快门一样，真正的写交给取景循环：PTP 通道独占，
+    /// 在别的线程上另发一条命令只会和正在抓帧的循环互相打乱事务号。
+    func setISO(_ value: Int) {
+        enqueue(.iso(UInt32(max(value, 1))))
+    }
+
+    /// 把曝光补偿设成指定值（单位 1/1000 EV）。
+    func setExposureComp(milliEV: Int) {
+        let clamped = min(max(milliEV, -WritableParam.evMaxMilli), WritableParam.evMaxMilli)
+        enqueue(.exposureComp(Int16(clamping: clamped)))
+    }
+
+    private func enqueue(_ w: WriteRequest) {
+        guard running, !capturing else { return }
+        gate.lock()
+        pendingWrite = w
+        gate.unlock()
+        DispatchQueue.main.async {
+            self.writing = true
+            self.writeNote = nil
+        }
+    }
+
+    private func takeWrite() -> WriteRequest? {
+        gate.lock()
+        let w = pendingWrite
+        pendingWrite = nil
+        gate.unlock()
+        return w
     }
 
     // MARK: - 主循环
@@ -163,6 +211,12 @@ final class LiveSession: ObservableObject {
             // 相机在曝光、存图，本来就没法同时出取景帧。
             if takeCaptureRequest() {
                 shoot(session: session)
+            }
+
+            // 改参数排在快门后面。改一次要写 + 回读，也占通道，
+            // 但没有按快门那么急。
+            if let w = takeWrite() {
+                performWrite(w, session: session)
             }
 
             var gotFrame = false
@@ -230,6 +284,7 @@ final class LiveSession: ObservableObject {
                 guard let d = try? session.readPropRaw(code),
                       let v = CameraReadout.signed16(d) else { continue }
                 r.exposureComp = CameraReadout.evText(v)
+                r.exposureCompMilli = Int(v)
                 r.missingFields.removeAll { $0 == "补偿" }
                 break
             }
@@ -241,6 +296,82 @@ final class LiveSession: ObservableObject {
                 r.missingFields.removeAll { $0 == "模式" }
             }
         }
+    }
+
+    /// 写一条参数，然后读回来比对。
+    ///
+    /// 关键在于「读回来比对」这一步。`0x9205` 回 OK 只说明相机收下了命令，
+    /// 不代表把这个值用上了——常见的结果是相机把它夹到了最近的合法档位，
+    /// 或者因为当前模式不允许而原样不动。**界面必须显示相机实际的值**，
+    /// 显示「已设为 ISO 6400」而实际还是 3200，比报错还糟糕。
+    private func performWrite(_ w: WriteRequest, session: SonyPtpSession) {
+        do {
+            switch w {
+            case .iso(let v):
+                try session.writeSDIOUInt32(CameraProp.iso, v)
+                let got = waitForISO(v, session: session)
+                if let got {
+                    publishWrite(note: "ISO 已改成 \(got)", failed: false)
+                } else {
+                    let actual = (try? session.readProperties())
+                        .flatMap { SonySDIO.scalar($0, CameraProp.iso) }
+                        .map { UInt32(truncatingIfNeeded: $0) & 0x00FF_FFFF }
+                    publishWrite(note: "写下去相机收下了，但回读到的不是 \(v)"
+                        + (actual.map { "（实际 \($0)）" } ?? "（回读也失败了）"),
+                        failed: true)
+                }
+
+            case .exposureComp(let mv):
+                try session.writeSDIOInt16(CameraProp.exposureComp, mv)
+                let got = waitForEV(Int(mv), session: session)
+                if let got {
+                    publishWrite(note: "曝光补偿已改成 \(CameraReadout.evText(Int64(got)))", failed: false)
+                } else {
+                    publishWrite(note: "曝光补偿写下去没生效。这台机身可能不认这个码"
+                        + "（0xD224），或者当前模式下不能用补偿。", failed: true)
+                }
+            }
+        } catch {
+            publishWrite(note: "改参数失败：\(error.localizedDescription)", failed: true)
+        }
+    }
+
+    private func publishWrite(note: String, failed: Bool) {
+        DispatchQueue.main.async {
+            self.writing = false
+            self.writeNote = note
+            // 成功的提示自动消失，失败的留着——让人有机会看清到底怎么了。
+            guard !failed else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
+                if self?.writeNote == note {
+                    self?.writeNote = nil
+                }
+            }
+        }
+    }
+
+    /// 轮询等 ISO 变成目标值。相机改完到属性刷新有几十毫秒延迟，
+    /// 写完立刻读会读回旧值，从而误判成失败。
+    private func waitForISO(_ target: UInt32, session: SonyPtpSession) -> UInt32? {
+        for _ in 0..<8 {
+            Thread.sleep(forTimeInterval: 0.1)
+            guard let props = try? session.readProperties(),
+                  let raw = SonySDIO.scalar(props, CameraProp.iso) else { continue }
+            let base = UInt32(truncatingIfNeeded: raw) & 0x00FF_FFFF
+            if base == target { return base }
+        }
+        return nil
+    }
+
+    private func waitForEV(_ target: Int, session: SonyPtpSession) -> Int? {
+        for _ in 0..<8 {
+            Thread.sleep(forTimeInterval: 0.1)
+            guard let props = try? session.readProperties() else { continue }
+            let v = SonySDIO.scalar(props, CameraProp.exposureComp)
+                ?? SonySDIO.scalar(props, CameraProp.exposureCompStd)
+            if let v, Int(v) == target { return Int(v) }
+        }
+        return nil
     }
 
     // MARK: - 快门
@@ -316,6 +447,7 @@ final class LiveSession: ObservableObject {
             self.running = false
             self.fps = 0
             self.capturing = false
+            self.writing = false
             // 斑马纹是「现在这一帧」的状态，循环停了就不该还挂在画面上，
             // 否则用户会对着一张静止的帧以为现在还在溢出。
             self.zebra = nil
