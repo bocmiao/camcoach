@@ -59,6 +59,15 @@ final class CameraProbe: NSObject, ObservableObject {
     @Published private(set) var hasCamera = false
     /// 每次 didAdd 的原始描述，原样留着，不加工。
     @Published private(set) var rawDevices: [String] = []
+    /// 相机主动推来的 PTP 事件的计数，按事件码分组。
+    ///
+    /// 这类事件（常见的是 `0xC203` 属性变更）在取景时一秒能来十几条。
+    /// 逐条写进日志会把真正的探测记录冲掉——上一份报告里就有一百多条
+    /// 「收到 PTP 事件 16 字节」，用户翻半天找不到结论。
+    /// 同类事件只在第一次出现时记一条，之后只累加计数。
+    @Published private(set) var eventCounts: [String: Int] = [:]
+    /// 已经记过日志的事件码，之后只计数。
+    private var loggedEventCodes: Set<UInt16> = []
 
     /// 整个 App 生命周期只用一个浏览器，不为每轮扫描重建。
     ///
@@ -373,6 +382,15 @@ final class CameraProbe: NSObject, ObservableObject {
                 }
             }
         }
+
+        // 事件单独统计在末尾。日志里只留每个码的第一条，
+        // 这里给出全量次数，两头都不丢信息，报告也不会被刷屏。
+        if !eventCounts.isEmpty {
+            out += "\n-- PTP 事件计数（日志里只记每个码的第一条）--\n"
+            for (code, count) in eventCounts.sorted(by: { $0.key < $1.key }) {
+                out += "\(code)：\(count) 次\n"
+            }
+        }
         return out
     }
 
@@ -490,10 +508,39 @@ final class CameraProbe: NSObject, ObservableObject {
         }
 
         let sdio = props.filter { $0.code >= 0xD000 }
-        log(.info, "其中索尼私有属性 \(sdio.count) 条",
-            detail: sdio.prefix(60).map { p in
-                p.label + (p.enabled ? "" : "(当前无效)") + (p.writable ? "可写" : "")
-            }.joined(separator: " "))
+        // 全部列出，不截断。上一版只打了前 60 条，结果「0xD224 到底有没有」
+        // 这件事在报告里查不到，只能靠猜——猜错一次就要多烧一轮构建和一次插拔。
+        // 323 条听上去多，按行排开也就二十来行。
+        log(.info, "其中索尼私有属性 \(sdio.count) 条", detail: propertyDump(sdio))
+
+        // 标准段只有个位数，全列。光圈能读出来就说明这一段是通的。
+        let std = props.filter { $0.code < 0xD000 }
+        log(.info, "标准 PTP 属性 \(std.count) 条", detail: propertyDump(std))
+
+        // 取景页要用到的每一个码，逐条摊开：有没有、什么类型、当前值多少。
+        // 这是回答「为什么某格显示 —」的唯一办法。
+        let watch: [(UInt16, String)] = [
+            (CameraProp.shutter, "快门 0xD20D"),
+            (CameraProp.shutter2, "快门 0xD229"),
+            (CameraProp.iso, "ISO 0xD21E"),
+            (CameraProp.fNumber, "光圈 0x5007"),
+            (CameraProp.exposureComp, "曝光补偿 0xD224"),
+            (CameraProp.exposureCompStd, "曝光补偿 0x5010"),
+            (CameraProp.exposureProgram, "曝光模式 0x500E"),
+            (CameraProp.focusFound, "对焦 0xD213"),
+            (CameraProp.battery, "电量 0xD218"),
+            (CameraProp.shotsSlot1, "可拍张数 0xD249"),
+        ]
+        for (code, name) in watch {
+            if let p = SonySDIO.find(props, code) {
+                log(.ok, "\(name) = \(p.current.display)",
+                    detail: String(format: "数据类型 0x%04X", p.dataType)
+                        + "　\(p.enabled ? "当前有效" : "当前模式下无效")"
+                        + "　\(p.writable ? "可写" : "只读")")
+            } else {
+                log(.warn, "\(name) 这块属性里没有")
+            }
+        }
 
         for (code, name) in [(PTP.propLiveViewStatus, "取景状态 D221"),
                              (PTP.propObjectInMemory, "内存图像 D215"),
@@ -576,6 +623,32 @@ final class CameraProbe: NSObject, ObservableObject {
         main {
             self.logs.append(ProbeLog(level: level, text: text, detail: detail, at: Date()))
         }
+    }
+
+    /// 把属性列表排成每行 14 个的清单。
+    ///
+    /// 一条属性写成 `0xD224` + 可写 + 当前无效 三部分，行宽控制在八十字符上下，
+    /// 复制出去在手机上也不会被折行折得看不清。
+    ///
+    /// 名字不叫 `dump`：标准库有个同名函数，撞上了虽然能编过，
+    /// 但以后谁想在这里调系统那个 `dump` 就会被自己的方法挡住。
+    private func propertyDump(_ props: [SonySDIO.Property]) -> String {
+        guard !props.isEmpty else { return "（一条都没有）" }
+        let perLine = 14
+        var lines: [String] = []
+        var i = 0
+        while i < props.count {
+            let end = min(i + perLine, props.count)
+            let row = props[i..<end].map { p -> String in
+                var s = p.label
+                if !p.enabled { s += "×" }
+                if p.writable { s += "w" }
+                return s
+            }.joined(separator: " ")
+            lines.append(row)
+            i = end
+        }
+        return lines.joined(separator: "\n")
     }
 
     private func finish(_ p: String) {
@@ -712,8 +785,45 @@ extension CameraProbe: ICCameraDeviceDelegate {
     }
 
     func cameraDevice(_ camera: ICCameraDevice, didReceivePTPEvent data: Data) {
-        log(.info, "收到 PTP 事件 \(data.count) 字节",
-            detail: data.prefix(16).map { String(format: "%02X", $0) }.joined(separator: " "))
+        let code = Self.eventCode(data)
+        let label = String(format: "0x%04X", code)
+        main { self.eventCounts[label, default: 0] += 1 }
+
+        // 同一个事件码只记第一次。后面成百上千条长这样，内容一样，
+        // 逐条记只会把报告撑长，让真正能定位问题的行被挤走。
+        guard !loggedEventCodes.contains(code) else { return }
+        loggedEventCodes.insert(code)
+        log(.info, "第一次收到事件 \(label)",
+            detail: """
+            事件是相机主动推的消息，不是我们请求的数据。同类事件之后只计数，
+            不再逐条记，完整次数在报告末尾的「PTP 事件计数」里。
+            \(Self.eventName(code))
+            原始：\(data.prefix(20).map { String(format: "%02X", $0) }.joined(separator: " "))
+            """)
+    }
+
+    /// 事件容器：Length(4) + Type(2) + Code(2) + TransactionID(4) + 参数。
+    private static func eventCode(_ d: Data) -> UInt16 {
+        let b = [UInt8](d)
+        guard b.count >= 8 else { return 0 }
+        return UInt16(b[6]) | (UInt16(b[7]) << 8)
+    }
+
+    private static func eventName(_ code: UInt16) -> String {
+        switch code {
+        case 0xC203:
+            return "0xC203 = 索尼属性变更通知。参数 1 表示「有属性变了」，参数 2 表示「批量变了一批」。"
+        case 0xC201:
+            return "0xC201 = 对焦状态变化。"
+        case 0xC202:
+            return "0xC202 = 快门/按键状态变化。"
+        case 0x4008:
+            return "0x4008 = 设备未响应。"
+        case 0x4002:
+            return "0x4002 = 对象新增，通常是有新照片进卡。"
+        default:
+            return "这个码目前没登记含义，原样留着对照。"
+        }
     }
 }
 

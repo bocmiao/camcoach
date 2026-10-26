@@ -8,8 +8,15 @@ import UIKit
 /// 真实参数，再下面是本地算出来的一两句话建议。
 struct LiveViewScreen: View {
 
+    let data: CameraData
+
     @StateObject private var live = LiveSession.shared
     @State private var stats: ExposureStats?
+    /// 相机自检页。它必须先停掉取景才能跑（同一条 PTP 通道），
+    /// 所以这里用 sheet 而不是 tab：点开就盖住取景，退出就回来，因果关系直观。
+    @State private var showProbe = false
+    /// 「存到相册」点完之后的一句确认。
+    @State private var savedNote: String?
 
     var body: some View {
         ScrollView {
@@ -18,10 +25,12 @@ struct LiveViewScreen: View {
                 if let err = live.lastError {
                     errorRow(err)
                 }
-                paramBar
-                statusBar
+                params
+                if let shot = live.lastShot {
+                    shotRow(shot)
+                }
                 adviceList
-                controlBar
+                controls
                 footnote
             }
             .padding(.horizontal, 12)
@@ -30,6 +39,21 @@ struct LiveViewScreen: View {
         .background(Color(.systemGroupedBackground))
         .navigationTitle("取景")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    live.stop()
+                    showProbe = true
+                } label: {
+                    Label("相机自检", systemImage: "wrench.and.screwdriver")
+                }
+            }
+        }
+        .sheet(isPresented: $showProbe) {
+            NavigationStack {
+                ProbeView(data: data)
+            }
+        }
         .onAppear { attachIfNeeded() }
         .onChange(of: live.frameCount) { _ in refreshStats() }
     }
@@ -72,7 +96,7 @@ struct LiveViewScreen: View {
                 .font(.footnote)
                 .foregroundStyle(.white.opacity(0.7))
             if !live.hasCamera {
-                Text("先去「连相机」点开始探测，连上再回来")
+                Text("点右上角的扳手，先做一次相机自检")
                     .font(.caption2)
                     .foregroundStyle(.white.opacity(0.45))
             }
@@ -124,6 +148,24 @@ struct LiveViewScreen: View {
         }
     }
 
+    /// 两排参数 + 它们下面可能出现的说明。
+    ///
+    /// 合在一起是为了控制最外层 VStack 的子视图数量：SwiftUI 的
+    /// ViewBuilder 最多吃 10 个直接子视图，超了会报一句看不出原因的
+    /// 「Extra argument in call」。
+    private var params: some View {
+        VStack(spacing: 8) {
+            paramBar
+            statusBar
+            if !live.readout.missingFields.isEmpty && live.running {
+                missingNote
+            }
+            if let note = live.captureNote {
+                errorRow(note)
+            }
+        }
+    }
+
     private func chip(_ label: String, _ value: String) -> some View {
         VStack(spacing: 2) {
             Text(label)
@@ -131,6 +173,7 @@ struct LiveViewScreen: View {
                 .foregroundStyle(.secondary)
             Text(value)
                 .font(.system(size: 15, weight: .semibold, design: .rounded))
+                .foregroundStyle(value == "—" ? Color.secondary.opacity(0.45) : Color.primary)
                 .lineLimit(1)
                 .minimumScaleFactor(0.6)
         }
@@ -138,6 +181,27 @@ struct LiveViewScreen: View {
         .padding(.vertical, 7)
         .background(Color(.secondarySystemGroupedBackground))
         .clipShape(RoundedRectangle(cornerRadius: 9))
+    }
+
+    /// 「机身没给」的说明。
+    ///
+    /// 不写这段话，用户看到「—」只会以为 App 坏了，然后去换线、重插。
+    /// 把「是哪几项、为什么」直接说出来，问题就停在产品层，不进排查流程。
+    private var missingNote: some View {
+        let names = live.readout.missingFields.joined(separator: "、")
+        let sentence = "这台机身没通过 PTP 报出「" + names + "」，所以那几格是「—」。"
+            + "其余参数是相机真实值。"
+        return HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "info.circle")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .padding(.top, 2)
+            Text(sentence)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
     }
 
     // MARK: - 建议
@@ -224,6 +288,92 @@ struct LiveViewScreen: View {
             .font(.caption2)
             .foregroundStyle(.tertiary)
             .fixedSize(horizontal: false, vertical: true)
+    }
+
+    // MARK: - 快门
+
+    /// 取景开关 + 快门。两者都是「操作」，放在一起，不夹在参数中间。
+    private var controls: some View {
+        VStack(spacing: 10) {
+            controlBar
+            shutterBar
+        }
+    }
+
+    private var shutterBar: some View {
+        VStack(spacing: 8) {
+            Button {
+                live.capture()
+            } label: {
+                ZStack {
+                    Circle()
+                        .stroke(Color.primary.opacity(0.18), lineWidth: 2)
+                        .frame(width: 66, height: 66)
+                    Circle()
+                        .fill(live.running && !live.capturing
+                              ? Color.primary : Color.secondary.opacity(0.25))
+                        .frame(width: 54, height: 54)
+                    if live.capturing {
+                        ProgressView()
+                            .progressViewStyle(.circular)
+                            .tint(.white)
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+            .disabled(!live.running || live.capturing)
+
+            Text(live.capturing ? "正在拍…" : (live.running ? "拍一张" : "开始取景后才能拍"))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            if live.shotCount > 0 {
+                Text("这次已拍 \(live.shotCount) 张")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 2)
+    }
+
+    /// 拍完的缩略图。存不存由用户决定，不自动写相册——
+    /// 自动写会在第一次弹权限框，而那时取景还在跑，看起来像卡死。
+    private func shotRow(_ image: UIImage) -> some View {
+        HStack(spacing: 10) {
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFill()
+                .frame(width: 62, height: 44)
+                .clipped()
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("刚拍的")
+                    .font(.caption.weight(.medium))
+                Text("照片本来就在相机卡里，这里是它回传的一份")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+
+            Button {
+                live.saveLastShot(image)
+                savedNote = "已提交保存，去相册看看"
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { savedNote = nil }
+            } label: {
+                Text(savedNote == nil ? "存相册" : "已提交")
+                    .font(.caption.weight(.medium))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.accentColor.opacity(0.14))
+                    .clipShape(Capsule())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(8)
+        .background(Color(.secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 
     private func errorRow(_ text: String) -> some View {

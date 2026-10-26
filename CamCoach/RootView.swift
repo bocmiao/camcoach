@@ -22,7 +22,7 @@ struct MainTabs: View {
     var body: some View {
         TabView {
             NavigationStack {
-                LiveViewScreen()
+                LiveViewScreen(data: data)
             }
             .tabItem {
                 Label("取景", systemImage: "camera.viewfinder")
@@ -54,13 +54,6 @@ struct MainTabs: View {
             }
             .tabItem {
                 Label("上手", systemImage: "checklist")
-            }
-
-            NavigationStack {
-                ProbeView(data: data)
-            }
-            .tabItem {
-                Label("连相机", systemImage: "cable.connector")
             }
         }
     }

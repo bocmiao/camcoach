@@ -23,6 +23,12 @@ struct CameraReadout: Equatable {
     var isoValue: Double?
     /// 这轮读回多少条属性。0 说明整块没读到。
     var propertyCount = 0
+    /// 这台机身没通过 PTP 报出来的项（显示名）。
+    ///
+    /// 「读不到」和「读到了但是 0」是两件完全不同的事，界面上必须分开说：
+    /// 前者是相机不给，后者是真的参数。把两者都显示成「—」，
+    /// 用户会以为是 App 坏了，然后一路去查线。
+    var missingFields: [String] = []
 
     static let empty = CameraReadout()
 }
@@ -43,6 +49,13 @@ enum CameraProp {
 
     static let fNumber: UInt16 = 0x5007
     static let exposureProgram: UInt16 = 0x500E
+    /// 曝光补偿的标准 PTP 码（ExposureBiasCompensation，INT16，单位 1/1000 EV）。
+    ///
+    /// 索尼多数机身用私有段 `0xD224`，但也有机身把补偿留在标准段。
+    /// 两个都试一遍，比赌一个码可靠——反正读不到只是多花 5 毫秒。
+    static let exposureCompStd: UInt16 = 0x5010
+    /// 标准 PTP 的曝光时间。少数机身只报这一条，不报 `0xD20D`。
+    static let exposureTimeStd: UInt16 = 0x500D
 }
 
 // MARK: - 解码
@@ -61,23 +74,35 @@ extension CameraReadout {
             // 少数机身把快门放在 0xD229（只在 mode 2 下有效）。
             r.shutter = Self.shutterText(v)
             r.shutterSeconds = Self.shutterSeconds(v)
+        } else {
+            r.missingFields.append("快门")
         }
 
         if let v = SonySDIO.scalar(props, CameraProp.iso) {
             r.iso = Self.isoText(v)
             r.isoValue = Self.isoNumber(v)
+        } else {
+            r.missingFields.append("ISO")
         }
 
         if let v = SonySDIO.scalar(props, CameraProp.fNumber) {
             r.aperture = Self.fNumberText(v)
+        } else {
+            r.missingFields.append("光圈")
         }
 
         if let v = SonySDIO.scalar(props, CameraProp.exposureComp) {
             r.exposureComp = Self.evText(v)
+        } else if let v = SonySDIO.scalar(props, CameraProp.exposureCompStd) {
+            r.exposureComp = Self.evText(v)
+        } else {
+            r.missingFields.append("补偿")
         }
 
         if let v = SonySDIO.scalar(props, CameraProp.exposureProgram) {
             r.mode = Self.modeText(v)
+        } else {
+            r.missingFields.append("模式")
         }
 
         if let v = SonySDIO.scalar(props, CameraProp.focusFound) {
@@ -86,14 +111,20 @@ extension CameraReadout {
             case 2, 3: r.focus = "合焦"
             default: r.focus = "未合焦"
             }
+        } else {
+            r.missingFields.append("对焦")
         }
 
         if let v = SonySDIO.scalar(props, CameraProp.battery) {
             r.battery = Self.percentText(v)
+        } else {
+            r.missingFields.append("电量")
         }
 
         if let v = SonySDIO.scalar(props, CameraProp.shotsSlot1) {
             r.shotsLeft = v > 0 ? "\(v)" : "—"
+        } else {
+            r.missingFields.append("可拍")
         }
 
         if let v = SonySDIO.scalar(props, CameraProp.liveView) {
@@ -101,6 +132,19 @@ extension CameraReadout {
         }
 
         return r
+    }
+
+    /// 单条读回来的 2 字节：按有符号解释。曝光补偿是 INT16，负数表示减曝光。
+    static func signed16(_ d: Data) -> Int64? {
+        guard d.count >= 2 else { return nil }
+        let raw = UInt16(d[d.startIndex]) | (UInt16(d[d.startIndex + 1]) << 8)
+        return Int64(Int16(bitPattern: raw))
+    }
+
+    /// 单条读回来的 2 字节：按无符号解释。曝光模式是 UINT16。
+    static func unsigned16(_ d: Data) -> Int64? {
+        guard d.count >= 2 else { return nil }
+        return Int64(UInt16(d[d.startIndex]) | (UInt16(d[d.startIndex + 1]) << 8))
     }
 
     // MARK: 快门
@@ -165,15 +209,19 @@ extension CameraReadout {
 
     // MARK: 其它
 
-    /// 标准 PTP 的曝光模式：1 手动 / 2 程序 / 3 光圈优先 / 4 快门优先。
-    /// 索尼机身的编号与之相同，但这台机型的实测还没覆盖全，界面上只给字母。
+    /// 标准 PTP 的曝光模式：1 手动 / 2 程序 / 3 光圈优先 / 4 快门优先，
+    /// 5/6/7 是程序偏移、程序偏移（动作）、人像这三种旧定义。
+    ///
+    /// 认不出来的值**不回「—」**，直接显示成 `0x0010` 这样的原始值。
+    /// 显示「—」等于把线索扔掉：既分不清「机身没报」和「报了但没认出来」，
+    /// 也没法据此补表。把原始值显出来，下一版就能照着补。
     static func modeText(_ raw: Int64) -> String {
         switch raw {
         case 1: return "M"
-        case 2: return "P"
+        case 2, 5, 6, 7: return "P"
         case 3: return "A"
         case 4: return "S"
-        default: return "—"
+        default: return String(format: "0x%04X", UInt16(truncatingIfNeeded: raw))
         }
     }
 

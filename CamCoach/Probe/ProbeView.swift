@@ -3,7 +3,7 @@ import ImageCaptureCore
 import SwiftUI
 import UIKit
 
-/// 连相机这一页。
+/// 相机自检这一页。
 ///
 /// 前面加了一组硬条件检查。这几条任何一条不满足，连上也会秒断，
 /// 而且现象都一样（点开始没反应），不先确认就只能靠猜。
@@ -14,6 +14,7 @@ struct ProbeView: View {
     @StateObject private var probe = CameraProbe.shared
     @State private var confirmed: Set<String> = []
     @State private var copied = false
+    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         List {
@@ -26,9 +27,12 @@ struct ProbeView: View {
             logSection
         }
         .listStyle(.insetGrouped)
-        .navigationTitle("连相机")
+        .navigationTitle("相机自检")
         .navigationBarTitleDisplayMode(.large)
         .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button("完成") { dismiss() }
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
                     UIPasteboard.general.string = probe.reportText
@@ -155,7 +159,7 @@ struct ProbeView: View {
         } header: {
             Text("取景画面")
         } footer: {
-            Text("这一帧是相机通过 PTP 送过来的。能看到它，说明读取参数和连续取景都能做。")
+            Text("这一帧是相机通过 PTP 送过来的。能看到它，说明读取参数和连续取景都能做。\n点左上角「完成」回到取景页，按「开始取景」就接上了。")
         }
     }
 

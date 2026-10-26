@@ -24,11 +24,22 @@ final class LiveSession: ObservableObject {
     @Published private(set) var lastError: String?
     /// 连续抓不到帧的次数，用来判断是「偶发」还是「真断了」。
     @Published private(set) var missCount = 0
+    /// 刚拍下来的那张。取景循环拍完会把它回传给这里。
+    @Published private(set) var lastShot: UIImage?
+    /// 快门正在进行中。拍一张要一秒多，期间必须把按钮按住不让再点。
+    @Published private(set) var capturing = false
+    /// 拍摄出问题时给用户看的一句话，成功就清空。
+    @Published private(set) var captureNote: String?
+    @Published private(set) var shotCount = 0
 
     private var camera: ICCameraDevice?
     private let queue = DispatchQueue(label: "camcoach.liveview", qos: .userInitiated)
     private let gate = NSLock()
     private var stopRequested = false
+    private var captureRequested = false
+    /// 单条兜底读的轮次。整块里读不到的项不能每轮都去撞一次，
+    /// 但又不能只试一次——用户中途拧一下补偿旋钮就变了。
+    private var singleReadRound = 0
 
     private init() {}
 
@@ -52,14 +63,16 @@ final class LiveSession: ObservableObject {
     func start() {
         guard !running else { return }
         guard let cam = camera else {
-            lastError = "还没有相机。先去「连相机」点开始探测，连上之后再回来。"
+            lastError = "还没有相机。点右上角的扳手做一次相机自检，连上之后再回来。"
             return
         }
         running = true
         lastError = nil
+        captureNote = nil
         missCount = 0
         frameCount = 0
         setStop(false)
+        setCaptureRequest(false)
 
         Task {
             if !cam.hasOpenSession {
@@ -79,6 +92,28 @@ final class LiveSession: ObservableObject {
     func stop() {
         setStop(true)
         running = false
+        capturing = false
+    }
+
+    /// 按一下快门。
+    ///
+    /// 真正的动作交给取景循环去做，因为 PTP 通道是独占的：
+    /// 在这边另起一条线去发命令，会和正在抓帧的循环抢事务号，两边都坏。
+    /// 这里只挂一个请求，循环下一圈自己取走。
+    func capture() {
+        guard running, !capturing else { return }
+        capturing = true
+        captureNote = nil
+        setCaptureRequest(true)
+    }
+
+    /// 把拍到的图存进系统相册。
+    ///
+    /// 单独留一个方法而不是拍完自动存：自动存会在第一次弹权限框，
+    /// 而权限框弹出时取景循环还在跑，用户看到的是「画面卡住了」，
+    /// 很难联想到是权限。手动点一下，因果关系清楚。
+    func saveLastShot(_ image: UIImage) {
+        UIImageWriteToSavedPhotosAlbum(image, nil, nil, nil)
     }
 
     // MARK: - 主循环
@@ -103,9 +138,25 @@ final class LiveSession: ObservableObject {
         while !isStopped() {
             if tick % propertyEveryNFrames == 0 {
                 if let props = try? session.readProperties(), !props.isEmpty {
-                    let r = CameraReadout.decode(props)
-                    DispatchQueue.main.async { self.readout = r }
+                    var r = CameraReadout.decode(props)
+                    // 整块里没有的项，隔一阵用单条读补一次。
+                    // 每 8 轮（约 16 秒）试一次，够跟上手拧旋钮的节奏，
+                    // 又不会让取景帧率被这些必然失败的请求拖下去。
+                    if !r.missingFields.isEmpty {
+                        singleReadRound += 1
+                        if singleReadRound % 8 == 1 {
+                            fillBySingleRead(&r, session: session)
+                        }
+                    }
+                    let snapshot = r
+                    DispatchQueue.main.async { self.readout = snapshot }
                 }
+            }
+
+            // 快门优先。拍的这一下会占住通道一两秒，取景会短暂停住，这是正常的：
+            // 相机在曝光、存图，本来就没法同时出取景帧。
+            if takeCaptureRequest() {
+                shoot(session: session)
             }
 
             var gotFrame = false
@@ -153,6 +204,67 @@ final class LiveSession: ObservableObject {
         finish()
     }
 
+    // MARK: - 单条兜底
+
+    /// 整块属性里读不到的项，改用标准 PTP 的单条读再试一次。
+    ///
+    /// 只处理「整块没给」这一种情况：整块给了但值认不出，不是这里的事。
+    /// 读到了就把这一项从 `missingFields` 里摘掉，界面上立刻变成真实值；
+    /// 读不到就原样留着，界面继续显示「机身未给」——那才是事实。
+    private func fillBySingleRead(_ r: inout CameraReadout, session: SonyPtpSession) {
+        if r.missingFields.contains("补偿") {
+            // 私有段优先。索尼不认这条命令时会回 0x2005，readPropRaw 返回 nil。
+            for code in [CameraProp.exposureComp, CameraProp.exposureCompStd] {
+                guard let d = try? session.readPropRaw(code),
+                      let v = CameraReadout.signed16(d) else { continue }
+                r.exposureComp = CameraReadout.evText(v)
+                r.missingFields.removeAll { $0 == "补偿" }
+                break
+            }
+        }
+        if r.missingFields.contains("模式") {
+            if let d = try? session.readPropRaw(CameraProp.exposureProgram),
+               let v = CameraReadout.unsigned16(d) {
+                r.mode = CameraReadout.modeText(v)
+                r.missingFields.removeAll { $0 == "模式" }
+            }
+        }
+    }
+
+    // MARK: - 快门
+
+    /// 拍一张，然后把图取回来。
+    ///
+    /// 这一步会把取景循环占住一到两秒，期间界面上的画面是静止的。
+    /// 不另开线程并发去做：PTP 通道独占，两个命令交错发出去相机只会回 DeviceBusy。
+    private func shoot(session: SonyPtpSession) {
+        do {
+            try session.captureStill()
+        } catch {
+            DispatchQueue.main.async {
+                self.capturing = false
+                self.captureNote = "快门没按下去：\(error.localizedDescription)"
+            }
+            return
+        }
+        if let jpeg = try? session.pollCapturedJPEG(timeout: 6), let image = UIImage(data: jpeg) {
+            DispatchQueue.main.async {
+                self.lastShot = image
+                self.capturing = false
+                self.captureNote = nil
+                self.shotCount += 1
+            }
+        } else {
+            DispatchQueue.main.async {
+                self.capturing = false
+                // 照片大概率拍到了，只是相机没回传。这句要写清「照片在卡里」，
+                // 不然用户会以为白拍了。
+                self.captureNote = "快门按下了，照片应该在相机卡里；相机没把它回传过来（要相机开着自动回传）。"
+                self.shotCount += 1
+            }
+        }
+    }
+
     // MARK: - 小工具
 
     private func setStop(_ v: Bool) {
@@ -168,6 +280,21 @@ final class LiveSession: ObservableObject {
         return v
     }
 
+    private func setCaptureRequest(_ v: Bool) {
+        gate.lock()
+        captureRequested = v
+        gate.unlock()
+    }
+
+    /// 取走一次快门请求。取走即清零，避免连按变成连拍。
+    private func takeCaptureRequest() -> Bool {
+        gate.lock()
+        let v = captureRequested
+        captureRequested = false
+        gate.unlock()
+        return v
+    }
+
     private func publish(error: String) {
         DispatchQueue.main.async { self.lastError = error }
     }
@@ -176,6 +303,7 @@ final class LiveSession: ObservableObject {
         DispatchQueue.main.async {
             self.running = false
             self.fps = 0
+            self.capturing = false
         }
     }
 }

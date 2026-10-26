@@ -136,6 +136,20 @@ final class SonyPtpSession {
         return SonySDIO.parseAll(d)
     }
 
+    /// 单条读一个属性值。`0x9209` 整块里没出现的码，用它兜底再试一次。
+    ///
+    /// 这条是标准 PTP 命令，索尼对私有段 `0xD2xx` 是否认，机型之间有差异：
+    /// A7 系多数机身会回 `0x2005`（不支持）或 `0x201D`（参数错），
+    /// 但对标准段 `0x50xx` 通常有效。**读不到是正常结果，不是错误**，
+    /// 所以这里把失败码也算作「已应答」，返回 nil 由调用方决定怎么显示。
+    func readPropRaw(_ code: UInt16) throws -> Data? {
+        let r = try send(PTP.getDevicePropValue, params: [UInt32(code)],
+                         expectsData: true,
+                         accepted: [0x2001, 0x2005, 0x200D, 0x201D, 0x201F])
+        if r.code != 0x2001 { return nil }
+        return r.data
+    }
+
     // MARK: - 实时取景
 
     /// 等取景就绪。D221 非 0 表示相机已经把取景对象挂出来了。

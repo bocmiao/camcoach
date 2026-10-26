@@ -43,6 +43,9 @@ targets:
         # 缺了它 ICDeviceBrowser 一台设备都枚举不出来，而且不报错、不弹窗，
         # 现象就是「点了没反应」——排查时会一路往协议层找，方向全错。
         NSCameraUsageDescription: 连接相机后读取取景画面与拍摄参数，用于在拍摄时给出提示。画面只在本机处理，不上传。
+        # 「存到相册」用的。只写不读，所以是 Add 而不是完整相册权限，
+        # 弹出来的框也少一句「读取你的照片」。
+        NSPhotoLibraryAddUsageDescription: 把刚拍的照片存进相册，方便你回头挑片。
 
     settings:
       base:
@@ -55,10 +58,11 @@ targets:
         # 而且上传不可撤销 —— 占掉的号永远拿不回来。
         #
         # 已用掉：1、2、3（都是 ios.yml 还挂 push 时自动上传的，白占）
-        # 当前：4 = 第一个带相机探测功能的包
+        # 4 = 第一个带相机探测功能的包；5–13 = 探测链路一路修到出画面
+        # 当前：14 = 取景页修 tab 折叠 + 机身未给说明 + 快门按钮 + 事件降噪
         #
         # 发新包前先在这里 +1，再手动触发 ios.yml。
-        CURRENT_PROJECT_VERSION: "13"
+        CURRENT_PROJECT_VERSION: "14"
         # 手动签名：证书和 profile 都由 CI 从 secrets 导入，不让 Xcode 自己去要
         CODE_SIGN_STYLE: Manual
         TARGETED_DEVICE_FAMILY: "1"
