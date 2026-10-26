@@ -39,6 +39,10 @@ targets:
         ITSAppUsesNonExemptEncryption: false
         # 连相机走本地网络，这条文案不给的话 iOS 会静默拦截
         NSLocalNetworkUsageDescription: 连接相机时需要访问本地网络，用于读取取景画面与拍摄参数。
+        # ImageCaptureCore 在 iOS 上把 USB 相机当外部相机处理，读这条声明。
+        # 缺了它 ICDeviceBrowser 一台设备都枚举不出来，而且不报错、不弹窗，
+        # 现象就是「点了没反应」——排查时会一路往协议层找，方向全错。
+        NSCameraUsageDescription: 连接相机后读取取景画面与拍摄参数，用于在拍摄时给出提示。画面只在本机处理，不上传。
 
     settings:
       base:

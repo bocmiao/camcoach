@@ -3,13 +3,6 @@ import ImageCaptureCore
 import SwiftUI
 import UIKit
 
-struct CheckRow: Identifiable {
-    let id = UUID()
-    let label: String
-    let value: String
-    let ok: Bool
-}
-
 /// 连相机这一页。
 ///
 /// 前面加了一组硬条件检查。这几条任何一条不满足，连上也会秒断，
@@ -124,7 +117,7 @@ struct ProbeView: View {
             Text("相机")
         } footer: {
             if preflightDone {
-                Text("相机用数据线连 iPhone，连接方式选「遥控拍摄」（屏幕显示 -PC-），再点开始。")
+                Text("选「遥控拍摄」后，那个设置提示框按「关闭」退回拍摄画面，再点开始。弹窗还开着时相机没完成 USB 切换。")
             } else {
                 Text("上面还有 \(data.connectChecks.count - confirmed.count) 项没确认。")
             }
@@ -151,28 +144,62 @@ struct ProbeView: View {
         }
     }
 
-    // MARK: - 环境自检
+    // MARK: - 自检
 
+    /// 找不到相机时，这一栏是唯一有信息量的地方。
+    ///
+    /// 五级按「由外到内」排：授权 → 声明 → 枚举 → 过滤 → 环境。
+    /// 上面一级没通，下面几级的结论都不作数，所以从上往下看，
+    /// 第一个红的就是断点。
     private var selfCheckSection: some View {
         Section {
-            ForEach(buildRows()) { r in
-                HStack(alignment: .top, spacing: 12) {
-                    Image(systemName: r.ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                        .foregroundStyle(r.ok ? Color.green : Color.orange)
-                        .font(.system(size: 15))
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(r.label).font(.subheadline)
-                        Text(r.value)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-                .padding(.vertical, 2)
-            }
+            ladderRow(1, "访问授权",
+                      "内容 \(probe.contentsAuth)　控制 \(probe.controlAuth)",
+                      authState)
+            ladderRow(2, "用途声明",
+                      cameraUsageDeclared
+                        ? "NSCameraUsageDescription 已声明"
+                        : "缺 NSCameraUsageDescription，系统会静默不枚举",
+                      cameraUsageDeclared ? LadderState.pass : .fail)
+            ladderRow(3, "设备枚举",
+                      "浏览器\(probe.browsingNow ? "在跑" : "没在跑")，"
+                        + "枚举到 \(probe.enumeratedCount) 台，didAdd 回调 \(probe.addCount) 次",
+                      enumerateState)
+            ladderRow(4, "过滤条件", probe.browseMask,
+                      probe.browseMask == "未设置" ? .unknown : .pass)
+            ladderRow(5, "环境",
+                      "\(appVersion)　\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)",
+                      .pass)
         } header: {
-            Text("环境自检")
+            Text("自检")
+        } footer: {
+            Text("从上往下看，第一个红色就是断点。右上角「复制」会把这份状态连同日志一起导出。")
         }
+    }
+
+    private func ladderRow(_ n: Int, _ title: String, _ value: String,
+                           _ state: LadderState) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text("\(n)")
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .foregroundStyle(.secondary)
+                .frame(width: 18, height: 18)
+                .background(Color.secondary.opacity(0.15))
+                .clipShape(Circle())
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.subheadline)
+                Text(value)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 6)
+            Image(systemName: state.icon)
+                .font(.system(size: 14))
+                .foregroundStyle(state.color)
+                .padding(.top, 1)
+        }
+        .padding(.vertical, 2)
     }
 
     // MARK: - 日志
@@ -235,34 +262,54 @@ struct ProbeView: View {
         }
     }
 
-    private func buildRows() -> [CheckRow] {
-        var out: [CheckRow] = []
-
+    private var appVersion: String {
         let info = Bundle.main.infoDictionary
-        let ver = info?["CFBundleShortVersionString"] as? String ?? "未知"
-        let build = info?["CFBundleVersion"] as? String ?? "未知"
-        out.append(CheckRow(label: "版本", value: "\(ver)（\(build)）", ok: true))
+        let ver = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        return "\(ver)（\(build)）"
+    }
 
-        let dev = UIDevice.current
-        out.append(CheckRow(label: "系统", value: "\(dev.systemName) \(dev.systemVersion)", ok: true))
-        out.append(CheckRow(label: "机型", value: dev.model, ok: true))
+    /// App 自己检查自己的 Info.plist。缺这条声明时系统静默不枚举设备，
+    /// 光看现象是看不出来的，所以必须显式查一遍。
+    private var cameraUsageDeclared: Bool {
+        Bundle.main.object(forInfoDictionaryKey: "NSCameraUsageDescription") != nil
+    }
 
-        let osv = ProcessInfo.processInfo.operatingSystemVersion
-        let ptpOK = osv.majorVersion > 15 || (osv.majorVersion == 15 && osv.minorVersion >= 2)
-        out.append(CheckRow(
-            label: "PTP 命令通道",
-            value: ptpOK ? "系统版本满足（要 15.2 以上）" : "系统版本偏低，需要 iOS 15.2 以上",
-            ok: ptpOK
-        ))
+    private var authState: LadderState {
+        if probe.contentsAuth == "已授权" && probe.controlAuth == "已授权" { return .pass }
+        if probe.contentsAuth == "未查询" && probe.controlAuth == "未查询" { return .unknown }
+        if probe.contentsAuth.contains("拒绝") || probe.controlAuth.contains("拒绝") { return .fail }
+        return probe.running ? .waiting : .fail
+    }
 
-        // 真引用一次，链接器才会真的去要 ImageCaptureCore。
-        _ = ICCameraDevice.self
-        out.append(CheckRow(
-            label: "ImageCaptureCore",
-            value: "框架已链接，ICCameraDevice 可引用",
-            ok: true
-        ))
+    private var enumerateState: LadderState {
+        if probe.enumeratedCount > 0 { return .pass }
+        if probe.running { return .waiting }
+        if probe.addCount > 0 { return .fail }
+        return .unknown
+    }
+}
 
-        return out
+/// 自检每一级的状态。语义是「这一级通了没有」，不是「好不好」，
+/// 所以 unknown 用空心圈，不跟着报错变红。
+enum LadderState {
+    case pass, fail, waiting, unknown
+
+    var icon: String {
+        switch self {
+        case .pass: return "checkmark.circle.fill"
+        case .fail: return "xmark.circle.fill"
+        case .waiting: return "circle.dotted"
+        case .unknown: return "circle"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .pass: return .green
+        case .fail: return .red
+        case .waiting: return .orange
+        case .unknown: return .secondary
+        }
     }
 }

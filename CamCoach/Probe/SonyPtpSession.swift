@@ -10,9 +10,12 @@ import ImageCaptureCore
 ///   3. 0x9209 一次读回全部属性（含 D221：取景是否就绪）
 ///   4. 0x1008 查对象信息 → 0x1009 取对象，句柄 0xFFFFC002 是实时取景
 ///
-/// 认证那四步的参数必须是 `[1,0,0]` / `[2,0,0]` / `[0x00C8]` / `[3,0,0]`。
+/// 认证那四步的参数必须是 `[1,0,0]` / `[2,0,0]` / `[版本]` / `[3,0,0]`。
 /// 只传 `[1]`、`[2]` 这类单参数是发不通的，相机只会回一个通用错误，
 /// 看起来像「命令码写错了」，实际是参数个数不对。
+///
+/// 0x9202 的参数是「想协商的协议版本」，机型之间有差异：
+/// A7 IV 上实测用 0x012C，老一点的机身用 0x00C8。两个都试一遍。
 ///
 /// 这里的 send 是**同步阻塞**的（用信号量等 ImageCaptureCore 回调），
 /// 所以只能在后台线程调用，不要放在主线程上。
@@ -37,9 +40,14 @@ final class SonyPtpSession {
     /// 一次取景就绪需要等多久。相机切到 PC 遥控状态本身要几秒。
     private static let authRetries = 6
     private static let liveViewPolls = 50
+    /// 0x9202 可以拿来协商的协议版本，按优先级排。A7 IV 吃 0x012C。
+    private static let protocolCandidates: [UInt32] = [0x012C, 0x00C8]
 
     private let camera: ICCameraDevice
     private var txn: UInt32 = 0
+
+    /// 认证过程中每一步的结果，探针报告里直接展示，方便定位卡在哪。
+    private(set) var authTrace: [String] = []
 
     /// 认证用的协议版本，相机在 0x9202 里回。见 `authenticate()` 返回值。
     private(set) var protocolVersion: UInt16 = 0
@@ -48,12 +56,26 @@ final class SonyPtpSession {
         self.camera = camera
     }
 
+    // MARK: - 设备信息
+
+    /// 读一次设备信息的原始负载。**不需要索尼认证**，所以它是排查链上最干净的一级：
+    /// 能读出来就说明 USB 枚举、会话、命令通道三层全通。
+    ///
+    /// 返回原始字节而不是解析结果，是为了把「相机没应答」和
+    /// 「有应答但解不出来」分开——这两种情况的下一步完全不同。
+    func deviceInfoRaw() throws -> Data? {
+        let r = try send(PTP.getDeviceInfo, expectsData: true)
+        return r.data
+    }
+
     // MARK: - 认证
 
     /// 走完索尼的四步认证。返回相机声明支持的 PTP 协议版本（通常是 0x00C8）。
     @discardableResult
     func authenticate() throws -> UInt16 {
+        authTrace.removeAll()
         _ = try send(PTP.sonyConnect, params: [1, 0, 0], expectsData: true)
+        authTrace.append("0x9201[1,0,0] → OK")
 
         // 第二步可能回 DeviceBusy，相机还在切模式。给几次机会。
         var lastError: Error?
@@ -68,24 +90,28 @@ final class SonyPtpSession {
             }
         }
         if let lastError { throw lastError }
+        authTrace.append("0x9201[2,0,0] → OK")
 
-        var versionData: Data?
-        for _ in 0..<Self.authRetries {
-            let r = try send(PTP.sonyExtDeviceInfo, params: [0x00C8],
-                             expectsData: true, allowBusy: true)
-            if let d = r.data, d.count >= 2 {
-                versionData = d
+        // 0x9202 回的是相机最终接受的版本号，机型之间不同（A7 IV 是 0x012C）。
+        // 按候选表逐个谈，每个候选给几次机会——切模式期间相机回 DeviceBusy。
+        for candidate in Self.protocolCandidates {
+            for _ in 0..<Self.authRetries {
+                let r = try? send(PTP.sonyExtDeviceInfo, params: [candidate],
+                                  expectsData: true, allowBusy: true)
+                guard let d = r?.data, d.count >= 2 else {
+                    Thread.sleep(forTimeInterval: 0.15)
+                    continue
+                }
+                let v = UInt16(d[d.startIndex]) | (UInt16(d[d.startIndex + 1]) << 8)
+                authTrace.append(String(format: "0x9202 要 0x%04X，相机回 0x%04X",
+                                        candidate, v))
+                if v >= 0x00C8 { protocolVersion = v }
                 break
             }
-            Thread.sleep(forTimeInterval: 0.15)
+            if protocolVersion != 0 { break }
         }
-        guard let d = versionData, d.count >= 2 else {
+        guard protocolVersion != 0 else {
             throw PTPError(operation: PTP.sonyExtDeviceInfo, code: 0x2002, retryable: true)
-        }
-        protocolVersion = UInt16(d[d.startIndex]) | (UInt16(d[d.startIndex + 1]) << 8)
-        guard protocolVersion >= 0x00C8 else {
-            throw PTPError(operation: PTP.sonyExtDeviceInfo, code: protocolVersion,
-                           retryable: false)
         }
 
         _ = try send(PTP.sonyConnect, params: [3, 0, 0], expectsData: true)

@@ -42,6 +42,17 @@ final class CameraProbe: NSObject, ObservableObject {
     /// 探针抓到的第一帧取景，用来证明这条链路真的能出画面。
     @Published private(set) var previewFrame: UIImage?
 
+    // ---- 自检要显示的分层证据。找不到相机时，这几个值就是全部线索。
+    @Published private(set) var contentsAuth = "未查询"
+    @Published private(set) var controlAuth = "未查询"
+    @Published private(set) var browseMask = "未设置"
+    @Published private(set) var browsingNow = false
+    @Published private(set) var enumeratedCount = 0
+    /// didAdd 回调次数。它大于 0 而 enumeratedCount 是 0，说明设备进来又被判定为非相机。
+    @Published private(set) var addCount = 0
+    /// 每次 didAdd 的原始描述，原样留着，不加工。
+    @Published private(set) var rawDevices: [String] = []
+
     private let browser = ICDeviceBrowser()
     private var camera: ICCameraDevice?
     private var found = false
@@ -49,8 +60,6 @@ final class CameraProbe: NSObject, ObservableObject {
     override init() {
         super.init()
         browser.delegate = self
-        // 不设 browsedDeviceTypes：iOS 上这个成员不存在（macOS 才有），
-        // 默认就会枚举相机，够了。
     }
 
     // MARK: - 对外接口
@@ -60,40 +69,190 @@ final class CameraProbe: NSObject, ObservableObject {
         main {
             self.running = true
             self.logs.removeAll()
-            self.phase = "搜索设备"
+            self.phase = "申请授权"
             self.deviceLabel = "搜索中…"
             self.previewFrame = nil
             self.found = false
+            self.addCount = 0
+            self.enumeratedCount = 0
+            self.rawDevices.removeAll()
         }
-        log(.info, "开始搜索 USB 设备")
+        Task { await self.scan() }
+    }
 
-        browser.stop()
-        browser.start()
+    // MARK: - 找到设备
 
-        Task {
-            var waited = 0.0
-            while waited < 6.0 {
-                if self.found { break }
-                try? await Task.sleep(nanoseconds: 300_000_000)
-                waited += 0.3
+    /// 从授权一路走到找到设备，每一级都留证据。
+    ///
+    /// 顺序不能换。没授权时系统会静默不枚举，后面看到的全是假失败，
+    /// 排查时就会一路往协议层找，方向从一开始就是错的。
+    private func scan() async {
+        await requestAuthorizations()
+
+        // 启停必须回主线程。ICDeviceBrowser 靠发起线程的 runloop 派发回调，
+        // 在没有 runloop 的后台线程上调 start()，didAdd 永远不会来——
+        // 现象和「没插相机」一模一样。
+        await MainActor.run {
+            self.phase = "搜索设备"
+            // iOS 15.2 起才有的属性，默认值不一定含本地 USB。
+            // 显式指定「相机 + 本地连接」——少这一句，可能一台设备都枚举不到。
+            self.browser.browsedDeviceTypeMask = ICDeviceTypeMask(
+                rawValue: ICDeviceTypeMask.camera.rawValue
+                    | ICDeviceLocationTypeMask.local.rawValue)
+            self.browseMask = "相机 + 本地连接"
+            self.browser.stop()
+            self.browser.start()
+        }
+        log(.info, "浏览器已启动", detail: "isBrowsing = \(browser.isBrowsing)\n过滤条件：相机 + 本地连接")
+
+        // 20 秒。相机切到遥控模式会重连一次 USB，插上就点开始的话前几秒是空的。
+        let deadline = Date().addingTimeInterval(20)
+        var lastCount = -1
+        while Date() < deadline {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            let count = browser.devices?.count ?? 0
+            main {
+                self.enumeratedCount = count
+                self.browsingNow = self.browser.isBrowsing
             }
-            guard let cam = self.camera else {
-                self.log(.fail, "6 秒内没有发现相机", detail: """
-                三个最常见的原因，按顺序查：
-                ① 相机不在「遥控拍摄」模式（USB 连接方式要选「遥控拍摄」，屏幕会显示 -PC-）
-                ② 用的是充电线，不是数据线
-                ③ 系统弹窗问「允许访问相机」时点了拒绝
-                """)
-                self.finish("没有设备")
+            if count != lastCount {
+                lastCount = count
+                log(.info, "系统枚举到 \(count) 台设备")
+            }
+            if let cam = camera {
+                await runProbe(on: cam)
                 return
             }
-            await self.runProbe(on: cam)
+        }
+        diagnoseNoDevice()
+        finish("没有设备")
+    }
+
+    private func requestAuthorizations() async {
+        log(.info, "访问权限（询问前）", detail: "内容：\(Self.authLabel(browser.contentsAuthorizationStatus))"
+            + "／控制：\(Self.authLabel(browser.controlAuthorizationStatus))")
+
+        // 回调可能一直不来（框架没准备好）。等 8 秒没消息就读当前状态往下走，
+        // 不能让探针永远停在「申请授权」。
+        let contents = await withCheckedContinuation { (c: CheckedContinuation<ICAuthorizationStatus, Never>) in
+            let once = ResumeOnce(c)
+            DispatchQueue.main.async {
+                self.browser.requestContentsAuthorization { st in once.resume(st) }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
+                once.resume(self.browser.contentsAuthorizationStatus)
+            }
+        }
+        main { self.contentsAuth = Self.authLabel(contents) }
+
+        let control = await withCheckedContinuation { (c: CheckedContinuation<ICAuthorizationStatus, Never>) in
+            let once = ResumeOnce(c)
+            DispatchQueue.main.async {
+                self.browser.requestControlAuthorization { st in once.resume(st) }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
+                once.resume(self.browser.controlAuthorizationStatus)
+            }
+        }
+        main { self.controlAuth = Self.authLabel(control) }
+
+        if Self.isAuthorized(contents) && Self.isAuthorized(control) {
+            log(.ok, "已拿到相机访问授权")
+        } else {
+            log(.warn, "授权不全，系统可能直接不枚举设备",
+                detail: "内容：\(Self.authLabel(contents))／控制：\(Self.authLabel(control))\n"
+                    + "去 iOS 设置 → 取景助手，把「照片」和「相机」都打开，再回来重新点开始。")
         }
     }
 
+    /// `ICAuthorizationStatus` 的取值和 `AVAuthorizationStatus` 一致：
+    /// 0 未询问 / 1 受限 / 2 拒绝 / 3 已授权。
+    /// 按 rawValue 判断而不是写 case 名，少一层编译期依赖。
+    static func authLabel(_ status: ICAuthorizationStatus) -> String {
+        switch status.rawValue {
+        case 0: return "还没问过"
+        case 1: return "受系统限制"
+        case 2: return "已拒绝"
+        case 3: return "已授权"
+        default: return "未识别(\(status.rawValue))"
+        }
+    }
+
+    static func isAuthorized(_ status: ICAuthorizationStatus) -> Bool {
+        status.rawValue == 3
+    }
+
+    /// 找不设备时的分层结论。
+    ///
+    /// 三种情况的现象一样（界面上什么都没有），但原因完全不同，
+    /// 所以必须分开说，不然用户只能靠猜着换线。
+    private func diagnoseNoDevice() {
+        let count = browser.devices?.count ?? 0
+
+        if !browser.isBrowsing {
+            log(.fail, "浏览器没启动起来", detail: """
+            ICDeviceBrowser.start() 之后 isBrowsing 还是 false，
+            说明框架层就没跑，跟相机无关。退出 App 重开再点一次。
+            """)
+            return
+        }
+        if addCount > 0 || count > 0 {
+            log(.fail, "系统看到了设备，但没有一台被当成相机", detail: """
+            枚举到 \(count) 台，didAdd 回调 \(addCount) 次。
+            线和接口是好的，问题在相机报给系统的身份。
+            检查 USB 连接方式是不是「遥控拍摄」，以及设置弹窗关掉没有。
+            """)
+            return
+        }
+        log(.fail, "20 秒内系统一台 USB 设备都没枚举到", detail: """
+        这一级只反映 iPhone 有没有认到设备，跟 App 代码无关。
+        按顺序做，每一步都能独立得出结论：
+
+        ① 打开系统「照片」App，看底部有没有出现「导入」。
+           有 → 线和相机模式都没问题，问题在授权或 App；
+           没有 → iPhone 根本没认到这台相机，先别改代码。
+
+        ② 换一根线。随手的充电线大多只走电源两芯，枚举不到设备。
+
+        ③ 相机上「遥控拍摄设置」那个提示框按「关闭」，退回拍摄画面。
+           弹窗还开着的时候，相机没完成 USB 切换。
+
+        ④ 相机「设置 → USB → USB电源供给」改成关。
+           开着的时候相机会向手机要电，iOS 可能直接拒绝这个配件。
+
+        ⑤ iPhone 保持解锁，插上后别切到别的 App。
+
+        ⑥ 拔线，等 3 秒再插，插上后等相机屏幕出现 PC 标识再点开始。
+        """)
+    }
+
     /// 复制成纯文本，方便贴出来。
+    ///
+    /// 开头这段是分层快照：授权、过滤条件、枚举数量、原始设备描述。
+    /// 后面日志里的结论都建立在它之上，所以放在一起，别只贴日志。
     var reportText: String {
-        var out = "CamCoach 探针报告\n设备：\(deviceLabel)\n\n"
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let info = Bundle.main.infoDictionary
+        let ver = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        let cameraUsage = info?["NSCameraUsageDescription"] as? String
+
+        var out = "CamCoach 探针报告\n"
+        out += "时间：\(f.string(from: Date()))\n"
+        out += "版本：\(ver)（\(build)）\n"
+        out += "系统：\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)\n"
+        out += "声明 NSCameraUsageDescription：\(cameraUsage == nil ? "缺失" : "有")\n"
+        out += "\n-- 分层快照 --\n"
+        out += "内容授权：\(contentsAuth)    控制授权：\(controlAuth)\n"
+        out += "过滤条件：\(browseMask)    浏览器在跑：\(browsingNow ? "是" : "否")\n"
+        out += "枚举到的设备：\(enumeratedCount)    didAdd 回调：\(addCount)\n"
+        out += "当前相机：\(deviceLabel)\n"
+        for d in rawDevices {
+            out += "  · \(d)\n"
+        }
+        out += "\n-- 探测记录 --\n"
+
         for l in logs {
             let tag: String
             switch l.level {
@@ -143,13 +302,40 @@ final class CameraProbe: NSObject, ObservableObject {
     private func probeLink(on cam: ICCameraDevice) {
         let session = SonyPtpSession(camera: cam)
 
-        // ---- 1. 标准 PTP 通道
-        main { self.phase = "标准 PTP" }
+        // ---- 1. 命令通道。GetDeviceInfo 不需要索尼认证，是整条链上最干净的一级：
+        // 能读出来就同时证明「USB 枚举通了、会话通了、命令通道通了」。
+        main { self.phase = "读设备信息" }
         do {
-            // 认证前先撞一次，看这条通道本身通不通。
-            _ = try session.readProperties()
+            let raw = try session.deviceInfoRaw()
+            if let raw, let info = SonyDeviceInfo.parse(raw) {
+                log(.ok, "命令通道通了，相机在应答", detail: """
+                厂商扩展：\(info.vendorLabel)
+                厂商：\(info.manufacturer.isEmpty ? "未提供" : info.manufacturer)
+                型号：\(info.modelLabel)
+                固件：\(info.deviceVersion.isEmpty ? "未提供" : info.deviceVersion)
+                标准版本：0x\(String(format: "%04X", info.standardVersion))
+                操作 \(info.operationCount) 条，属性 \(info.propertyCount) 条
+                """)
+                if !info.isSony {
+                    log(.warn, "厂商扩展不是索尼",
+                        detail: "私有命令 0x92xx / D2xx 多半发不通，后面很可能全部失败")
+                }
+            } else {
+                log(.warn, "相机应答了，但设备信息解不出来", detail: """
+                回包 \(raw?.count ?? 0) 字节。
+                前 16 字节：\(raw.map { $0.prefix(16).map { String(format: "%02X", $0) }.joined(separator: " ") } ?? "空")
+                这台相机的 DeviceInfo 结构和标准 PTP 不一样，得按这份字节重新对格式。
+                """)
+            }
         } catch {
-            log(.info, "认证前读属性不通，符合预期")
+            log(.fail, "GetDeviceInfo 失败：\(error.localizedDescription)", detail: """
+            这一步不需要索尼认证。失败说明命令通道本身没通，常见原因：
+            ① 相机被系统「照片」App 占着（回桌面把它划掉）
+            ② 会话没真正打开
+            ③ 这台相机不接受 ImageCaptureCore 转发的命令
+            """)
+            finish("命令通道不通")
+            return
         }
 
         // ---- 2. 索尼认证
@@ -159,11 +345,15 @@ final class CameraProbe: NSObject, ObservableObject {
             log(.ok, "认证通过", detail: "相机声明 PTP 协议版本 "
                 + String(format: "0x%04X", ver))
         } catch {
+            let done = session.authTrace.isEmpty ? "（第一步就没过）" : session.authTrace.joined(separator: "\n")
             log(.fail, "认证失败：\(error.localizedDescription)", detail: """
-            四步顺序是 0x9201[1,0,0] → 0x9201[2,0,0] → 0x9202[0xC8] → 0x9201[3,0,0]。
-            卡在 0x9201[1] 一般说明相机不在遥控模式；
-            卡在 0x9202 一般说明固件不认这个协议版本。
-            认证不过，后面一切都读不到，这里就停。
+            已经走过的步骤：
+            \(done)
+
+            四步顺序是 0x9201[1,0,0] → 0x9201[2,0,0] → 0x9202[0x012C/0x00C8] → 0x9201[3,0,0]。
+            卡在 0x9201[1] 一般是相机不在遥控模式；
+            卡在 0x9202 一般是固件不认这两个协议版本。
+            认证不过，后面什么都读不到，这里就停。
             """)
             finish("认证未通过")
             return
@@ -280,11 +470,32 @@ final class CameraProbe: NSObject, ObservableObject {
 extension CameraProbe: ICDeviceBrowserDelegate {
 
     func deviceBrowser(_ browser: ICDeviceBrowser, didAdd device: ICDevice, moreComing: Bool) {
-        guard let cam = device as? ICCameraDevice else { return }
-        cam.delegate = self
+        // 不管是什么类型，先原样记下来。原来这里 `as? ICCameraDevice` 失败就
+        // 静默 return，一行日志都不留——「系统明明看到了设备」这件事就丢了，
+        // 排查时会误判成「系统一台设备都没看到」，方向直接跑偏。
+        let dump = String(describing: device)
+        let cam = device as? ICCameraDevice
         camera = cam
-        found = true
-        main { self.deviceLabel = cam.name ?? "相机" }
+        found = cam != nil
+
+        main {
+            self.addCount += 1
+            self.rawDevices.append(dump)
+            if let c = cam { self.deviceLabel = c.name ?? "相机" }
+        }
+        log(.info, "系统报来一台设备", detail: dump)
+
+        guard let cam = cam else {
+            log(.warn, "这台不是相机类设备（\(type(of: device))）", detail: """
+            只有 ICCameraDevice 才能发 PTP 命令。出现这种通常意味着：
+            相机的 USB 连接方式停在「MTP」或「存储」，没选「遥控拍摄」；
+            或者「遥控拍摄设置」那个弹窗还开着，没退回拍摄画面。
+            """)
+            return
+        }
+        cam.delegate = self
+        log(.ok, "已接管相机", detail: "名称：\(cam.name ?? "未报告")\n"
+            + "能力：\(cam.capabilities.isEmpty ? "未报告" : cam.capabilities.joined(separator: " "))")
     }
 
     func deviceBrowser(_ browser: ICDeviceBrowser, didRemove device: ICDevice, moreGoing: Bool) {
@@ -373,5 +584,26 @@ extension CameraProbe: ICCameraDeviceDelegate {
     func cameraDevice(_ camera: ICCameraDevice, didReceivePTPEvent data: Data) {
         log(.info, "收到 PTP 事件 \(data.count) 字节",
             detail: data.prefix(16).map { String(format: "%02X", $0) }.joined(separator: " "))
+    }
+}
+
+/// 保证 continuation 只被 resume 一次。
+///
+/// 授权回调可能来、8 秒超时也可能到，两个都 resume 会直接崩在
+/// "SWIFT TASK CONTINUATION MISUSE"。用一个带锁的一次性开关拦住。
+private final class ResumeOnce {
+    private var cont: CheckedContinuation<ICAuthorizationStatus, Never>?
+    private let lock = NSLock()
+
+    init(_ c: CheckedContinuation<ICAuthorizationStatus, Never>) {
+        cont = c
+    }
+
+    func resume(_ status: ICAuthorizationStatus) {
+        lock.lock()
+        let c = cont
+        cont = nil
+        lock.unlock()
+        c?.resume(returning: status)
     }
 }
