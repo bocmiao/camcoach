@@ -17,6 +17,8 @@ struct LiveViewScreen: View {
     /// 当前滤镜。和 LiveSession 里那份保持同步，那份给取景循环读。
     @State private var filterID = "none"
     @State private var filterStrength = 0.7
+    /// 今天拍什么。只影响风格条上显示哪几个，不影响别的。
+    @State private var scene: ShootScene = .all
     /// 导入的调色包。这里也持一份 shared，是为了保证它在主线程先被创建——
     /// 取景循环在后台线程也会读它，如果第一次访问发生在后台，
     /// @Published 就会在非主线程初始化，那是个不会报警的坑。
@@ -263,13 +265,16 @@ struct LiveViewScreen: View {
 
     private var filterBar: some View {
         VStack(alignment: .leading, spacing: 8) {
+            sceneBar
+
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
-                    ForEach(Filters.all) { f in
+                    ForEach(Filters.forScene(scene, keeping: filterID)) { f in
                         filterChip(f)
                     }
                     // 导入的调色包和内置风格放在同一条里，中间用一根竖线隔开。
                     // 不分成两行，是因为横滑两行用户根本滑不到第二行去。
+                    // 它们也不参与题材过滤：那是你自己带来的东西，不该被藏起来。
                     if !luts.entries.isEmpty {
                         Rectangle()
                             .fill(Color.secondary.opacity(0.25))
@@ -302,6 +307,42 @@ struct LiveViewScreen: View {
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
         }
+    }
+
+    /// 题材那一排。
+    ///
+    /// 做成朴素样式、不用强调色，是为了和下面那排风格区分开：
+    /// 一个是「我在哪个范围里挑」，一个是「我挑了哪个」，视觉上不该同等重要。
+    private var sceneBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(ShootScene.allCases) { s in
+                    sceneChip(s)
+                }
+            }
+            .padding(.horizontal, 2)
+        }
+    }
+
+    private func sceneChip(_ s: ShootScene) -> some View {
+        let on = s == scene
+        return Button {
+            scene = s
+        } label: {
+            Text(s.name)
+                .font(.system(size: 11, weight: on ? .semibold : .regular))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(on ? Color.primary.opacity(0.10) : Color.clear)
+                .foregroundStyle(on ? Color.primary : Color.secondary)
+                .clipShape(Capsule())
+                .overlay(
+                    Capsule().strokeBorder(on ? Color.clear
+                                              : Color.secondary.opacity(0.25),
+                                           lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
     }
 
     @ViewBuilder
@@ -366,6 +407,9 @@ struct LiveViewScreen: View {
     /// 打开相机一看不是，会觉得 App 骗人。
     private var filterNote: String {
         if filterID == "none" {
+            if scene != .all {
+                return scene.hint + "。想再动一点就横着挑一个，长按画面随时看原图。"
+            }
             return "调色只改这里的预览和存进相册的那一张，不改相机实际拍出来的照片。"
                 + "长按画面随时看原图。想要更多风格，点「＋ 调色包」导入 .cube 文件。"
         }

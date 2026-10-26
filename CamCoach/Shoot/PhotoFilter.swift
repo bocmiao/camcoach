@@ -44,6 +44,59 @@ struct PhotoFilter: Identifiable, Equatable {
     let look: Look
 }
 
+/// 你在拍什么。
+///
+/// 用户不一定懂「色温」「曲线」这些词，但一定知道自己今天是拍人还是拍景。
+/// 所以风格不按调色原理分类，按题材分：选一个题材，条上只剩跟它相关的几个。
+///
+/// 名字没叫 Scene，是因为 SwiftUI 里已经有个 Scene 协议，
+/// 同一个文件里 import SwiftUI 时重名会报一堆看不懂的错。
+enum ShootScene: String, CaseIterable, Identifiable {
+    case all, portrait, landscape, city, night, food
+
+    var id: String { rawValue }
+
+    var name: String {
+        switch self {
+        case .all: return "全部"
+        case .portrait: return "人像"
+        case .landscape: return "风景"
+        case .city: return "城市"
+        case .night: return "夜景"
+        case .food: return "食物"
+        }
+    }
+
+    /// 选了这个题材之后，一句话说清它到底替你解决什么。
+    ///
+    /// 不写「肤色更好看」这种话——那是广告词，看不出该不该开。
+    /// 写「额头不反光」，用户抬头看一眼画面就知道要不要用。
+    var hint: String {
+        switch self {
+        case .all: return ""
+        case .portrait: return "肤色不发脏，额头和鼻梁的反光不糊成白块"
+        case .landscape: return "天不死白，云有层次，绿色不脏"
+        case .city: return "墙和金属不泛黄，画面干净"
+        case .night: return "路灯招牌不糊成白块，暗部沉得住"
+        case .food: return "菜的颜色讨喜，但不会偏到变色"
+        }
+    }
+
+    /// 这个题材下推荐哪几个风格，按推荐程度排。
+    ///
+    /// 「原色」永远放第一个：选了题材又想退回不调的样子，不用再切回「全部」。
+    var ids: [String] {
+        switch self {
+        case .all: return Filters.all.map { $0.id }
+        case .portrait: return ["none", "soft", "fresh", "warm", "fade"]
+        case .landscape: return ["none", "clear", "cinema", "punch"]
+        case .city: return ["none", "cool", "cinema", "film", "noir"]
+        case .night: return ["none", "night", "cinema"]
+        case .food: return ["none", "warm", "punch", "film"]
+        }
+    }
+}
+
 enum Filters {
 
     /// 内置风格。顺序按「从不动到动得多」排，用户横着扫一遍就能找到想要的。
@@ -62,6 +115,13 @@ enum Filters {
                     look: Look(brightness: 0.06, contrast: 0.93, saturation: 0.84,
                                warmth: -0.22, highlightCut: 0.12, shadowLift: 0.05)),
 
+        // 人像专用。对比压低是重点：皮肤的斑、阴影里的色块，都是对比拉出来的。
+        // 高光再收一截，额头和鼻梁的反光不会糊成一片白。
+        PhotoFilter(id: "soft", name: "柔光",
+                    note: "拍人。对比压低、皮肤干净，额头反光不会糊成白块",
+                    look: Look(brightness: 0.03, contrast: 0.94, saturation: 0.92,
+                               warmth: 0.12, highlightCut: 0.18, shadowLift: 0.14)),
+
         PhotoFilter(id: "warm", name: "暖调",
                     note: "偏黄，傍晚、室内、吃的",
                     look: Look(brightness: 0.01, contrast: 1.04, saturation: 1.06,
@@ -76,6 +136,14 @@ enum Filters {
                     look: Look(brightness: -0.02, contrast: 1.14, saturation: 0.80,
                                warmth: 0.22, highlightCut: 0.28, shadowLift: 0.18,
                                vignette: 0.28)),
+
+        // 夜景用。高光压得比「电影」更狠：路灯、招牌、橱窗是过曝的重灾区，
+        // 不压下来整片就是白块。暗部再往下沉一点，画面才有夜的重量。
+        PhotoFilter(id: "night", name: "夜灯",
+                    note: "拍夜景。灯不糊成白块，暗部沉得住",
+                    look: Look(brightness: -0.03, contrast: 1.16, saturation: 1.08,
+                               warmth: 0.16, highlightCut: 0.34, shadowLift: -0.06,
+                               vignette: 0.22)),
 
         PhotoFilter(id: "film", name: "胶片",
                     note: "褪了色又带点暖，老照片那股",
@@ -119,6 +187,20 @@ enum Filters {
 
     static func isLUT(_ id: String) -> Bool {
         id.hasPrefix(lutPrefix)
+    }
+
+    /// 某个题材下该显示哪些风格。
+    ///
+    /// `keeping` 是当前已经选中的那个。如果它不在这个题材的推荐里，
+    /// 也要插到最前面留着——否则一切题材，用户明明选着「夜灯」，
+    /// 条上却一个都没高亮，会以为选择被重置了。
+    static func forScene(_ scene: ShootScene, keeping id: String) -> [PhotoFilter] {
+        if scene == .all { return all }
+        var list = scene.ids.map { find($0) }
+        if id != "none", !isLUT(id), !scene.ids.contains(id) {
+            list.insert(find(id), at: 0)
+        }
+        return list
     }
 }
 

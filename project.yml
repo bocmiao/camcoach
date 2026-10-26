@@ -64,9 +64,10 @@ targets:
         # 16 = 能改参数（ISO / 曝光补偿），写完回读确认
         # 17 = 实时滤镜（8 种色调 + 强度 + 长按看原图）
         # 18 = 风格包（10 个，参数组合）+ 导入 .cube LUT
+        # 19 = 按题材筛风格（人像/风景/城市/夜景/食物）+ 柔光、夜灯
         #
         # 发新包前先在这里 +1，再手动触发 ios.yml。
-        CURRENT_PROJECT_VERSION: "18"
+        CURRENT_PROJECT_VERSION: "19"
         # 手动签名：证书和 profile 都由 CI 从 secrets 导入，不让 Xcode 自己去要
         CODE_SIGN_STYLE: Manual
         TARGETED_DEVICE_FAMILY: "1"
