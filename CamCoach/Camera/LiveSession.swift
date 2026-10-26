@@ -109,8 +109,8 @@ final class LiveSession: ObservableObject {
             }
 
             var gotFrame = false
-            if let jpeg = try? session.liveViewFrame(), let data = jpeg,
-               let image = UIImage(data: data) {
+            // liveViewFrame 返回 Data?，try? 之后已经压成一层 Optional，直接绑到 data。
+            if let data = try? session.liveViewFrame(), let image = UIImage(data: data) {
                 gotFrame = true
                 windowFrames += 1
                 DispatchQueue.main.async {
