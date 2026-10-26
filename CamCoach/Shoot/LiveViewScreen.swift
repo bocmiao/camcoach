@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 /// 取景页。相机连上之后，这里才是真正用来拍照的界面。
 ///
@@ -16,6 +17,12 @@ struct LiveViewScreen: View {
     /// 当前滤镜。和 LiveSession 里那份保持同步，那份给取景循环读。
     @State private var filterID = "none"
     @State private var filterStrength = 0.7
+    /// 导入的调色包。这里也持一份 shared，是为了保证它在主线程先被创建——
+    /// 取景循环在后台线程也会读它，如果第一次访问发生在后台，
+    /// @Published 就会在非主线程初始化，那是个不会报警的坑。
+    @StateObject private var luts = LUTStore.shared
+    @State private var showImporter = false
+    @State private var importError: String?
     /// 长按画面时临时看原图。用 GestureState，松手自动弹回，不用自己管状态。
     @GestureState private var peekOriginal = false
     /// 弹出的那一页。用同一个状态管两种页，避免同一层挂两个 sheet。
@@ -84,6 +91,38 @@ struct LiveViewScreen: View {
         }
         .onChange(of: filterStrength) { _ in
             live.setFilter(id: filterID, strength: filterStrength)
+        }
+        .fileImporter(isPresented: $showImporter,
+                      allowedContentTypes: [.data],
+                      allowsMultipleSelection: false) { result in
+            handleImport(result)
+        }
+        .alert("这个调色包用不了", isPresented: alertShown) {
+            Button("知道了", role: .cancel) { importError = nil }
+        } message: {
+            Text(importError ?? "")
+        }
+    }
+
+    private var alertShown: Binding<Bool> {
+        Binding(get: { importError != nil },
+                set: { if !$0 { importError = nil } })
+    }
+
+    private func handleImport(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            guard let url = urls.first else { return }
+            do {
+                let entry = try luts.importFile(at: url)
+                // 导完直接切过去，用户能立刻看见效果，不用再回头找一遍。
+                filterID = Filters.lutPrefix + entry.name
+            } catch {
+                importError = error.localizedDescription
+            }
+        case .failure:
+            // 用户点取消也会走到这里，不算错，什么都不说。
+            break
         }
     }
 
@@ -229,6 +268,17 @@ struct LiveViewScreen: View {
                     ForEach(Filters.all) { f in
                         filterChip(f)
                     }
+                    // 导入的调色包和内置风格放在同一条里，中间用一根竖线隔开。
+                    // 不分成两行，是因为横滑两行用户根本滑不到第二行去。
+                    if !luts.entries.isEmpty {
+                        Rectangle()
+                            .fill(Color.secondary.opacity(0.25))
+                            .frame(width: 1, height: 18)
+                    }
+                    ForEach(luts.entries) { e in
+                        filterChip(Filters.fromLUT(name: e.name), removable: true)
+                    }
+                    importChip
                 }
                 .padding(.horizontal, 2)
                 .padding(.vertical, 1)
@@ -254,9 +304,10 @@ struct LiveViewScreen: View {
         }
     }
 
-    private func filterChip(_ f: PhotoFilter) -> some View {
+    @ViewBuilder
+    private func filterChip(_ f: PhotoFilter, removable: Bool = false) -> some View {
         let on = f.id == filterID
-        return Button {
+        let chip = Button {
             filterID = f.id
         } label: {
             Text(f.name)
@@ -269,16 +320,58 @@ struct LiveViewScreen: View {
                 .clipShape(Capsule())
         }
         .buttonStyle(.plain)
+
+        if removable {
+            // 长按弹菜单删除，而不是像列表那样左滑——这里是横向滚动条，
+            // 左滑和横滑会抢手势，滑不掉还容易误触。
+            chip.contextMenu {
+                Button(role: .destructive) {
+                    if f.id == filterID { filterID = "none" }
+                    luts.remove(id: f.id)
+                } label: {
+                    Label("删掉这个调色包", systemImage: "trash")
+                }
+            }
+        } else {
+            chip
+        }
     }
 
-    /// 每个状态都要说清「滤镜改的是什么、不改什么」。
+    private var importChip: some View {
+        Button {
+            showImporter = true
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "plus")
+                    .font(.system(size: 10, weight: .semibold))
+                Text("调色包")
+                    .font(.system(size: 12))
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(Color(.secondarySystemGroupedBackground))
+            .foregroundStyle(.secondary)
+            .clipShape(Capsule())
+            .overlay(
+                Capsule().strokeBorder(Color.secondary.opacity(0.35),
+                                       style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// 每个状态都要说清「调色改的是什么、不改什么」。
     ///
     /// 不说这句，用户会以为拍出来的照片就是这个颜色，
     /// 打开相机一看不是，会觉得 App 骗人。
     private var filterNote: String {
         if filterID == "none" {
-            return "滤镜是 App 内的后期，只改这里的预览和存进相册的那一张，"
-                + "不改相机实际拍出来的照片。长按画面随时看原图。"
+            return "调色只改这里的预览和存进相册的那一张，不改相机实际拍出来的照片。"
+                + "长按画面随时看原图。想要更多风格，点「＋ 调色包」导入 .cube 文件。"
+        }
+        if Filters.isLUT(filterID) {
+            return "「" + Filters.find(filterID).name + "」是你导入的调色包，"
+                + "只改预览和存进相册的那一张。长按画面看原图。"
         }
         return Filters.find(filterID).note + "　长按画面随时看原图。"
     }

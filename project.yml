@@ -62,10 +62,11 @@ targets:
         # 14 = 取景页收口（tab 折叠、机身未给说明、快门、事件降噪）
         # 15 = 高光斑马纹、直方图、按焦距算安全快门、标定采样
         # 16 = 能改参数（ISO / 曝光补偿），写完回读确认
-        # 当前：17 = 实时滤镜（8 种色调 + 强度 + 长按看原图）
+        # 17 = 实时滤镜（8 种色调 + 强度 + 长按看原图）
+        # 18 = 风格包（10 个，参数组合）+ 导入 .cube LUT
         #
         # 发新包前先在这里 +1，再手动触发 ios.yml。
-        CURRENT_PROJECT_VERSION: "17"
+        CURRENT_PROJECT_VERSION: "18"
         # 手动签名：证书和 profile 都由 CI 从 secrets 导入，不让 Xcode 自己去要
         CODE_SIGN_STYLE: Manual
         TARGETED_DEVICE_FAMILY: "1"
