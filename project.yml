@@ -58,7 +58,7 @@ targets:
         # 当前：4 = 第一个带相机探测功能的包
         #
         # 发新包前先在这里 +1，再手动触发 ios.yml。
-        CURRENT_PROJECT_VERSION: "9"
+        CURRENT_PROJECT_VERSION: "10"
         # 手动签名：证书和 profile 都由 CI 从 secrets 导入，不让 Xcode 自己去要
         CODE_SIGN_STYLE: Manual
         TARGETED_DEVICE_FAMILY: "1"
